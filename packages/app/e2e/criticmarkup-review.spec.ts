@@ -156,6 +156,52 @@ test.describe("CriticMarkup review flows", () => {
     });
   });
 
+  test("reopens a UI-created comment with a paragraph break as review feedback @smoke", async ({
+    page,
+  }) => {
+    const filePath = writeProjectFile(
+      projectDir,
+      "paragraph-comment.md",
+      "# Paragraph comment\n\nReview target text here.\n",
+    );
+    const comment = "First paragraph.\n\nSecond paragraph.";
+    await openMarkdownFile(page, filePath);
+    await selectRichText(page, "target text");
+    await page.getByTestId("selection-menu-action-comment").click();
+    await page.getByTestId("comment-rail-c1-editor").fill(comment);
+    await page.getByTestId("comment-rail-c1-action-save").click();
+    await expect
+      .poll(() => readProjectFile(projectDir, "paragraph-comment.md"))
+      .toContain(`{>>${comment}<<}`);
+
+    await expect(page.getByTestId("rich-text-editor")).not.toContainText(
+      "First paragraph.",
+    );
+    await expect(page.getByTestId("rich-text-editor")).not.toContainText(
+      "Second paragraph.",
+    );
+    await page.reload();
+    await expect(page.getByTestId("document-review-rail")).toContainText(
+      "First paragraph.",
+    );
+    await expect(page.getByTestId("document-review-rail")).toContainText(
+      "Second paragraph.",
+    );
+    await expect(page.getByTestId("rich-text-editor")).toContainText(
+      "Review target text here.",
+    );
+    await expect(page.getByTestId("rich-text-editor")).not.toContainText("{>>");
+    await expect(page.getByTestId("rich-text-editor")).not.toContainText(
+      "First paragraph.",
+    );
+    await expect(page.getByTestId("rich-text-editor")).not.toContainText(
+      "Second paragraph.",
+    );
+    logE2eEvent("criticmarkup.paragraph-comment-reopened", {
+      file: "paragraph-comment.md",
+    });
+  });
+
   test("animates the document layout when the review rail appears and disappears @smoke", async ({
     page,
   }) => {

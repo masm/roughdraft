@@ -1247,6 +1247,63 @@ function addCriticChangeRule(
   });
 }
 
+function createCommentBodyProtection(source: string) {
+  let prefix = "\uE000roughdraft-comment-";
+  while (
+    source.includes(prefix) ||
+    source.includes(encodeURIComponent(prefix))
+  ) {
+    prefix += "-";
+  }
+  const bodies = new Map<string, string>();
+  return {
+    protect(body: string) {
+      const placeholder = `${prefix}${bodies.size}\uE001`;
+      bodies.set(placeholder, body);
+      return placeholder;
+    },
+    restore(text: string, asHtml = false) {
+      let restored = text;
+      for (const [placeholder, body] of bodies) {
+        restored = restored.replaceAll(placeholder, () =>
+          asHtml ? escapeHtml(body) : body,
+        );
+        // Raw HTML protection stores Markdown in URI-encoded attributes.
+        restored = restored.replaceAll(encodeURIComponent(placeholder), () =>
+          encodeURIComponent(body),
+        );
+      }
+      return restored;
+    },
+  };
+}
+
+// Comment bodies are opaque review text. Marked splits blocks before its inline
+// tokenizers run, so shield multiline bodies until the CriticMarkup is parsed.
+function parseCriticMarkdown(
+  parser: Marked,
+  markdown: string,
+  comments: Map<string, CriticComment>,
+): string {
+  const source = markdown;
+  const protection = createCommentBodyProtection(source);
+  const protectedSource = source.replace(
+    /(?<!`)(`+)(?!`)[\s\S]*?(?<!`)\1(?!`)|\{>>([\s\S]*?)<<\}/g,
+    (raw, codeDelimiter: string | undefined, body: string | undefined) =>
+      codeDelimiter || body === undefined || !body.includes("\n")
+        ? raw
+        : `{>>${protection.protect(body)}<<}`,
+  );
+  const html = parser.parse(
+    protectRichTextRoundTripMarkdown(protectedSource),
+  ) as string;
+  for (const comment of comments.values()) {
+    comment.content = protection.restore(comment.content);
+  }
+  // Standalone examples in code remain literal, including their newlines.
+  return protection.restore(html, true);
+}
+
 function createCriticMarked(
   markdownOptions?: MarkdownOptions,
   endmatter?: ParsedEndmatter,
@@ -1397,7 +1454,7 @@ export function criticMarkdownHasReviewRail(
     options,
     parsedEndmatter,
   );
-  parser.parse(protectRichTextRoundTripMarkdown(body));
+  parseCriticMarkdown(parser, body, comments);
   addEndmatterFeedback(comments, parsedEndmatter);
   return comments.size > 0 || changes.size > 0;
 }
@@ -1418,7 +1475,7 @@ export function criticMarkdownToRenderedHtml(
     options,
     parsedEndmatter,
   );
-  const html = parser.parse(protectRichTextRoundTripMarkdown(body)) as string;
+  const html = parseCriticMarkdown(parser, body, comments);
   addEndmatterFeedback(comments, parsedEndmatter);
 
   return { html, comments, changes, frontmatter, endmatter };
@@ -1436,7 +1493,7 @@ export function criticMarkdownToEditorState(
   const { frontmatter, body, endmatter } = splitYamlDocumentMetadata(markdown);
   const parsedEndmatter = parseReviewEndmatter(endmatter);
   const { parser, comments } = createCriticMarked(options, parsedEndmatter);
-  const html = parser.parse(protectRichTextRoundTripMarkdown(body)) as string;
+  const html = parseCriticMarkdown(parser, body, comments);
   const doc = generateJSON(html, extensions) as JSONContent & {
     yamlFrontmatter?: string;
     yamlEndmatter?: string;
@@ -1503,20 +1560,40 @@ export function editorStateToCriticMarkdown(
     null;
   const changes = collectCriticChangesFromDoc(doc);
   const useEndmatter = Boolean(sourceEndmatter);
-  addCriticCommentRule(service, comments, useEndmatter);
-  addCriticChangeRule(service, comments, useEndmatter);
+  // Turndown list indentation and Markdown spacing normalization must not
+  // rewrite paragraph breaks or other formatting inside inline comment bodies.
+  const protection = createCommentBodyProtection(
+    [
+      html,
+      frontmatter,
+      sourceEndmatter,
+      ...[...comments.values()].map((comment) => comment.content),
+    ].join(""),
+  );
+  const inlineComments = new Map(
+    [...comments].map(([id, comment]) => [
+      id,
+      comment.content.includes("\n")
+        ? { ...comment, content: protection.protect(comment.content) }
+        : comment,
+    ]),
+  );
+  addCriticCommentRule(service, inlineComments, useEndmatter);
+  addCriticChangeRule(service, inlineComments, useEndmatter);
   addCriticCodeBlockRule(service);
   const endmatter = serializeReviewEndmatter(
     sourceEndmatter,
     comments,
     changes,
   );
-  return appendYamlEndmatter(
-    prependYamlFrontmatter(
-      normalizeBlockSpacing(`${service.turndown(html).trimEnd()}\n`),
-      frontmatter,
+  return protection.restore(
+    appendYamlEndmatter(
+      prependYamlFrontmatter(
+        normalizeBlockSpacing(`${service.turndown(html).trimEnd()}\n`),
+        frontmatter,
+      ),
+      endmatter,
     ),
-    endmatter,
   );
 }
 
