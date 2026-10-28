@@ -123,6 +123,82 @@ test.describe("CriticMarkup review flows", () => {
     logE2eEvent("legacy-replies.reopened", { file: "legacy-replies.md" });
   });
 
+  test("saves and reopens nested replies to YAML-only replies @smoke", async ({
+    page,
+  }) => {
+    const filePath = writeProjectFile(
+      projectDir,
+      "nested-yaml-reply.md",
+      [
+        "# Nested replies",
+        "",
+        "Review {==target text==}{>>Root comment<<}{#c1}.",
+        "",
+        "---",
+        "comments:",
+        "  c1:",
+        "    by: user",
+        '    at: "2026-04-28T12:00:00.000Z"',
+        "  c2:",
+        "    body: Existing AI reply",
+        "    by: AI",
+        '    at: "2026-04-28T12:01:00.000Z"',
+        "    re: c1",
+        "",
+      ].join("\n"),
+    );
+    await openMarkdownFile(page, filePath);
+    await page.getByTestId("comment-thread-c1").click();
+    await page.getByTestId("comment-rail-c2-action-reply").click();
+    logE2eEvent("criticmarkup.nested-yaml-reply-clicked", {
+      anchorIds: await page
+        .getByTestId("rich-text-editor")
+        .locator(".comment-anchor[data-comment-ids]")
+        .evaluateAll((elements) =>
+          elements.map((element) => element.getAttribute("data-comment-ids")),
+        ),
+      draftCount: await page.getByTestId("comment-rail-c3-editor").count(),
+    });
+    await expect(page.getByTestId("comment-rail-c3-editor")).toBeVisible();
+    await page
+      .getByTestId("comment-rail-c3-editor")
+      .fill("Nested user response");
+    await page.getByTestId("comment-rail-c3-action-save").click();
+    await expect
+      .poll(() => readProjectFile(projectDir, "nested-yaml-reply.md"))
+      .toContain("body: Nested user response");
+    expect(readProjectFile(projectDir, "nested-yaml-reply.md")).toContain(
+      "re: c2",
+    );
+    await page.reload();
+    await page.getByTestId("comment-thread-c1").click();
+    await expect(page.getByTestId("document-review-rail")).toContainText(
+      "Nested user response",
+    );
+    await page.getByTestId("comment-rail-c3-action-reply").click();
+    await page
+      .getByTestId("comment-rail-c4-editor")
+      .fill("Another nested response");
+    await page.getByTestId("comment-rail-c4-action-save").click();
+    await expect
+      .poll(() => readProjectFile(projectDir, "nested-yaml-reply.md"))
+      .toContain("body: Another nested response");
+    expect(readProjectFile(projectDir, "nested-yaml-reply.md")).toContain(
+      "re: c3",
+    );
+    await page.reload();
+    await page.getByTestId("comment-thread-c1").click();
+    await expect(page.getByTestId("document-review-rail")).toContainText(
+      "Another nested response",
+    );
+    await expect(page.getByTestId("rich-text-editor")).not.toContainText(
+      "Nested user response",
+    );
+    logE2eEvent("criticmarkup.nested-yaml-replies-reopened", {
+      file: "nested-yaml-reply.md",
+    });
+  });
+
   test("creates a new root comment and saves it to disk @smoke", async ({
     page,
   }) => {

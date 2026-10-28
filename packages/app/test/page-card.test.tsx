@@ -1675,6 +1675,88 @@ describe("PageCard editor integration", () => {
     expect(rendered.onSave).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["YAML AI reply", "comment", "AI", false],
+    ["YAML user reply", "comment", "user", false],
+    ["YAML suggestion reply", "suggestion", "AI", false],
+    ["inline AI reply", "comment", "AI", true],
+  ] as const)("opens and saves a nested reply to a loaded %s", async (_label, kind, author, inline) => {
+    const root = kind === "suggestion" ? "s1" : "c1";
+    const content = inline
+      ? `{==alpha==}{>>Root comment<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}{>>Existing reply<<}{id="c2" by="${author}" at="2026-04-28T12:01:00.000Z" re="c1"}\n`
+      : [
+          kind === "suggestion"
+            ? "{++alpha++}{#s1}"
+            : "{==alpha==}{>>Root comment<<}{#c1}",
+          "",
+          "---",
+          "comments:",
+          ...(kind === "comment"
+            ? ["  c1:", "    by: user", '    at: "2026-04-28T12:00:00.000Z"']
+            : []),
+          "  c2:",
+          "    body: Existing reply",
+          `    by: ${author}`,
+          '    at: "2026-04-28T12:01:00.000Z"',
+          `    re: ${root}`,
+          ...(kind === "suggestion"
+            ? [
+                "suggestions:",
+                "  s1:",
+                "    by: user",
+                '    at: "2026-04-28T12:00:00.000Z"',
+              ]
+            : []),
+          "",
+        ].join("\n");
+    const rendered = await renderPageCard({
+      page: { id: "nested-reply", title: "Nested reply", content },
+      selected: true,
+    });
+    await flushAnimationFrame();
+    await selectText(rendered.getEditor(), "alpha");
+    await flushAnimationFrame();
+    const replyButton = getByTestId<HTMLButtonElement>(
+      rendered.container,
+      "comment-rail-c2-action-reply",
+    );
+    await act(async () => {
+      replyButton.click();
+      await Promise.resolve();
+    });
+    await flushReact();
+    await flushAnimationFrame();
+    const editor = queryByTestId<HTMLTextAreaElement>(
+      rendered.container,
+      "comment-rail-c3-editor",
+    );
+    expect(editor).not.toBeNull();
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        "value",
+      )?.set?.call(editor, "Nested response");
+      editor?.dispatchEvent(new Event("input", { bubbles: true }));
+      await Promise.resolve();
+    });
+    const save = getByTestId<HTMLButtonElement>(
+      rendered.container,
+      "comment-rail-c3-action-save",
+    );
+    vi.useFakeTimers();
+    await act(async () => {
+      save.click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(500);
+      await Promise.resolve();
+    });
+    const saved = rendered.onSave.mock.calls.at(-1)?.[1];
+    expect(saved).toContain("Nested response");
+    expect(saved).toContain(inline ? 're="c2"' : "re: c2");
+  });
+
   it("deletes a whole root comment thread from the thread action", async () => {
     const rendered = await renderPageCard({
       page: {
