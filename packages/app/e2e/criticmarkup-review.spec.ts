@@ -63,6 +63,66 @@ test.describe("CriticMarkup review flows", () => {
     });
   });
 
+  test("preserves YAML replies to legacy comments after suggesting, autosave, and reopen @smoke", async ({
+    page,
+  }) => {
+    const filePath = writeProjectFile(
+      projectDir,
+      "legacy-replies.md",
+      [
+        "# Open questions",
+        'Review {==this==}{>>Needs detail<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}.',
+        "",
+        "---",
+        "comments:",
+        "  c2:",
+        "    body: I added context.",
+        "    by: AI",
+        '    at: "2026-04-28T12:01:00.000Z"',
+        "    re: c1",
+        "",
+      ].join("\n"),
+    );
+
+    await openMarkdownFile(page, filePath);
+    await expect(page.getByTestId("rich-text-editor")).toBeVisible();
+    await expect(page.getByTestId("document-mode-trigger")).toContainText(
+      "Suggesting",
+    );
+    await selectRichText(page, "Open questions");
+    await page.evaluate(() => {
+      const selection = window.getSelection();
+      const range = selection?.getRangeAt(0);
+      if (!range || !selection) throw new Error("Missing heading selection");
+      range.setStart(range.endContainer, range.endOffset - 1);
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.dispatchEvent(new Event("selectionchange", { bubbles: true }));
+    });
+    await page.keyboard.press("Backspace");
+    await expect
+      .poll(() => readProjectFile(projectDir, "legacy-replies.md"))
+      .toContain("{--s--}");
+    const saved = readProjectFile(projectDir, "legacy-replies.md");
+    logE2eEvent("legacy-replies.saved", {
+      structuredReply: saved.includes("    re: c1"),
+      flattenedEndmatter: saved.includes("* * *"),
+    });
+    expect(saved).toContain("\ncomments:\n");
+    expect(saved).toContain("    re: c1");
+    expect(saved).not.toContain("* * *");
+    await page.reload();
+    await page.getByTestId("comment-thread-c1").click();
+    await expect(page.getByTestId("document-review-rail")).toContainText(
+      "I added context.",
+    );
+    await expect(page.getByTestId("rich-text-editor")).not.toContainText(
+      "comments:",
+    );
+    await expect(page.locator('[data-critic-change-id="s1"]')).toHaveText("s");
+    logE2eEvent("legacy-replies.reopened", { file: "legacy-replies.md" });
+  });
+
   test("creates a new root comment and saves it to disk @smoke", async ({
     page,
   }) => {

@@ -2,6 +2,7 @@ import {
   buildCommentThreads,
   type CriticComment,
   flattenCommentThreads,
+  getCommentDescendantIds,
 } from "./critic-markup";
 
 interface CommentAnchorMeasurement {
@@ -199,7 +200,14 @@ export function buildCommentThreadRailItems(
   const items: CommentThreadRailItem[] = [];
 
   for (const group of groups) {
-    const visibleComments = group.commentIds
+    // YAML replies have parent links but no inline anchor of their own.
+    const threadCommentIds = new Set(
+      group.commentIds.flatMap((id) => [
+        id,
+        ...getCommentDescendantIds(id, comments),
+      ]),
+    );
+    const visibleComments = [...threadCommentIds]
       .map((commentId) => comments.get(commentId))
       .filter((comment): comment is CriticComment => Boolean(comment));
 

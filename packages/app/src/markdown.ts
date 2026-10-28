@@ -180,7 +180,7 @@ function isReviewEndmatterMap(value: unknown): boolean {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
-function hasDocumentLevelComment(value: unknown): boolean {
+function hasEndmatterFeedback(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 
   return Object.values(value as Record<string, unknown>).some(
@@ -190,8 +190,7 @@ function hasDocumentLevelComment(value: unknown): boolean {
       !Array.isArray(entry) &&
       typeof (entry as Record<string, unknown>).body === "string" &&
       typeof (entry as Record<string, unknown>).by === "string" &&
-      typeof (entry as Record<string, unknown>).at === "string" &&
-      typeof (entry as Record<string, unknown>).re !== "string",
+      typeof (entry as Record<string, unknown>).at === "string",
   );
 }
 
@@ -286,7 +285,7 @@ export function splitYamlDocumentMetadata(
   if (!precedingBody.includes("{#")) {
     const yamlText = candidate.replace(/^---[ \t]*(?:\r\n|\n)/, "");
     const parsed = parseYaml(yamlText) as Record<string, unknown> | null;
-    if (!hasDocumentLevelComment(parsed?.comments)) {
+    if (!hasEndmatterFeedback(parsed?.comments)) {
       return { frontmatter, body, endmatter: null };
     }
   }

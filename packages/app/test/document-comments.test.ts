@@ -210,6 +210,43 @@ describe("document comment layout helpers", () => {
     ]);
   });
 
+  it("includes YAML-only replies and nested replies under their anchored root", () => {
+    const comments = createCommentsMap([
+      { id: "c1", content: "Root", createdAt: "2026-04-24T00:00:00.000Z" },
+      {
+        id: "c2",
+        content: "Reply",
+        createdAt: "2026-04-24T00:00:01.000Z",
+        parentCommentId: "c1",
+      },
+      {
+        id: "c3",
+        content: "Nested reply",
+        createdAt: "2026-04-24T00:00:02.000Z",
+        parentCommentId: "c2",
+      },
+      {
+        id: "c4",
+        content: "Unrelated root",
+        createdAt: "2026-04-24T00:00:03.000Z",
+      },
+    ]);
+    const items = buildCommentThreadRailItems(
+      [{ key: "c1", commentIds: ["c1"], anchorTop: 200, anchorBottom: 214 }],
+      comments,
+    );
+    expect(items).toEqual([
+      {
+        key: "c1",
+        anchorGroupKey: "c1",
+        rootCommentId: "c1",
+        commentIds: ["c1", "c2", "c3"],
+        anchorTop: 200,
+        anchorBottom: 214,
+      },
+    ]);
+  });
+
   it("aligns the selected secondary root thread to the shared anchor", () => {
     const layouts = resolveCommentThreadRailLayouts(
       [
