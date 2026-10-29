@@ -93,6 +93,17 @@ interface CreateAppResult {
   close: () => void;
 }
 
+interface OpenLoadRequest {
+  id: string;
+  documentPath: string;
+  createdAt: number;
+  status: "opening" | "loaded" | "failed";
+  version?: string;
+  error?: string;
+  reviewContext?: ReviewContext;
+  journalId?: string;
+}
+
 interface OpenRequestClient {
   id: number;
   path: string | null;
@@ -410,6 +421,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       : null;
   const app = express();
   const openRequestClients = new Set<OpenRequestClient>();
+  const openLoads = new Map<string, OpenLoadRequest>();
   let reviewStore: ReviewStore | undefined;
   const getReviewStore = (
     onRecovered?: (event: ReviewCompletedEvent, delivered: boolean) => void,
@@ -540,9 +552,15 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   }
 
   function canonicalPath(documentPath: string): string {
-    return fs.existsSync(documentPath)
-      ? fs.realpathSync(documentPath)
-      : path.resolve(documentPath);
+    if (fs.existsSync(documentPath)) return fs.realpathSync(documentPath);
+    try {
+      return path.join(
+        fs.realpathSync(path.dirname(documentPath)),
+        path.basename(documentPath),
+      );
+    } catch {
+      return path.resolve(documentPath);
+    }
   }
 
   function contextPath(input: unknown, mustExist = true): string {
@@ -572,6 +590,34 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     const store = getReviewStore();
     store.assertJournal(req.body?.journalId);
     return parseReviewContext(req.body?.reviewContext);
+  }
+
+  function openLoad(id: unknown): OpenLoadRequest {
+    const load = typeof id === "string" ? openLoads.get(id) : undefined;
+    if (!load)
+      throw new ReviewStateError(
+        "recovery_unavailable",
+        "This transient browser opening is unknown; retry opening after a server restart.",
+      );
+    return load;
+  }
+
+  function validateOpenLoad(load: OpenLoadRequest): void {
+    const store = getReviewStore();
+    if (load.journalId) store.assertJournal(load.journalId);
+    const current = store.contextForPath(load.documentPath);
+    if (load.reviewContext) {
+      store.requireCurrent(load.documentPath, load.reviewContext);
+    } else if (
+      current &&
+      current.status !== "completed" &&
+      current.status !== "retired"
+    ) {
+      throw new ReviewStateError(
+        "stale_context",
+        "An active scoped review replaced this unscoped opening.",
+      );
+    }
   }
 
   // --- API routes ---
@@ -651,13 +697,16 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     res.write("retry: 1000\n\n");
 
     const sendChange = (stats: fs.Stats) => {
-      const exists = stats.nlink > 0;
+      let version: string | null = null;
+      if (stats.nlink > 0) {
+        try {
+          version = fileVersionFromFile(absolutePath);
+        } catch {
+          /* Missing, unreadable or changing: keep the browser draft and pause saves. */
+        }
+      }
       res.write(
-        `event: change\ndata: ${JSON.stringify({
-          path: relativePath,
-          exists,
-          version: exists ? fileVersionFromFile(absolutePath) : null,
-        })}\n\n`,
+        `event: change\ndata: ${JSON.stringify({ path: relativePath, exists: version !== null, version })}\n\n`,
       );
     };
 
@@ -665,7 +714,8 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       if (
         current.mtimeMs === previous.mtimeMs &&
         current.size === previous.size &&
-        current.nlink === previous.nlink
+        current.nlink === previous.nlink &&
+        current.ctimeMs === previous.ctimeMs
       ) {
         return;
       }
@@ -764,7 +814,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       );
     }
     if (
-      context &&
+      (context || req.body?.expectedVersion !== undefined) &&
       (typeof req.body?.expectedVersion !== "string" ||
         req.body.expectedVersion !== snapshot.version)
     )
@@ -1028,6 +1078,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       capabilities: {
         durableReviewEvents: 1,
         reviewContext: 1,
+        reviewOpenLoad: 1,
         projectPathRequired: true,
         fileSystemBrowsing: true,
         remoteDocuments: true,
@@ -1077,11 +1128,88 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     });
   });
 
+  app.get("/api/open-request/load", (req, res) => {
+    const load = openLoad(req.query.id);
+    try {
+      validateOpenLoad(load);
+    } catch (error) {
+      if (
+        !(error instanceof ReviewStateError) ||
+        (error.code !== "stale_context" && error.code !== "context_retired")
+      )
+        throw error;
+      load.status = "failed";
+      load.error = error.message;
+    }
+    res.json({ load });
+  });
+
+  app.post("/api/open-request/failure", (req, res) => {
+    const load = openLoad(req.body?.loadRequestId);
+    if (contextPath(req.body?.path, false) !== load.documentPath)
+      throw new ReviewStateError(
+        "stale_context",
+        "The failure belongs to another document.",
+      );
+    if (load.status !== "loaded") {
+      load.status = "failed";
+      load.error =
+        typeof req.body?.error === "string"
+          ? req.body.error.slice(0, 1000)
+          : "The requested Markdown file did not load.";
+    }
+    res.json({ load });
+  });
+
   app.post("/api/open-request/ack", (req, res) => {
     const store = getReviewStore();
-    const context = scopedContext(req);
+    const loadId = req.body?.loadRequestId;
+    if (
+      loadId !== undefined &&
+      (typeof loadId !== "string" ||
+        !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,255}$/.test(loadId))
+    )
+      throw new ReviewStateError(
+        "invalid_request",
+        "A load identifier is required.",
+        400,
+      );
+    const load = loadId === undefined ? undefined : openLoads.get(loadId);
+    if (load) validateOpenLoad(load);
+    const context =
+      req.body?.reviewContext === undefined ? undefined : scopedContext(req);
     const documentPath = contextPath(req.body?.path);
-    store.requireCurrent(documentPath, context);
+    if (!context && !load && loadId === undefined)
+      throw new ReviewStateError(
+        "invalid_request",
+        "A browser acknowledgment needs an opening or review context.",
+        400,
+      );
+    if (
+      load &&
+      (load.documentPath !== documentPath ||
+        Boolean(load.reviewContext) !== Boolean(context) ||
+        (context &&
+          load.reviewContext &&
+          !sameContext(context, load.reviewContext)))
+    )
+      throw new ReviewStateError(
+        "stale_context",
+        "This acknowledgment belongs to another opening context.",
+      );
+    if (!context && !load) {
+      const active = store.contextForPath(documentPath);
+      if (
+        active &&
+        active.status !== "completed" &&
+        active.status !== "retired"
+      )
+        throw new ReviewStateError(
+          "stale_context",
+          "An unscoped reload cannot acknowledge the active review.",
+        );
+    }
+    if (context) store.requireCurrent(documentPath, context);
     if (
       typeof req.body?.version !== "string" ||
       req.body.version !== fileVersionFromFile(documentPath)
@@ -1090,9 +1218,18 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
         "save_conflict",
         "The loaded document version is no longer current.",
       );
+    const accepted = context
+      ? store.acknowledge(documentPath, context, req.body.version)
+      : undefined;
+    if (load) {
+      load.status = "loaded";
+      load.version = req.body.version;
+      delete load.error;
+    }
     res.json({
       ...store.snapshot(),
-      context: store.acknowledge(documentPath, context, req.body.version),
+      ...(accepted ? { context: accepted } : {}),
+      ...(load ? { load } : {}),
     });
   });
 
@@ -1111,7 +1248,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       typeof payload.path === "string" && payload.path.trim()
         ? payload.path.trim()
         : null;
-    const targetUrl =
+    let targetUrl =
       typeof payload.url === "string" && payload.url.trim()
         ? payload.url.trim()
         : null;
@@ -1135,6 +1272,75 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       if (current?.status === "opening" || current?.status === "loaded")
         accepted = current;
     }
+    let load: OpenLoadRequest | undefined;
+    if (req.body?.loadRequestId !== undefined) {
+      const id = req.body.loadRequestId;
+      if (
+        typeof id !== "string" ||
+        !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,255}$/.test(id)
+      )
+        throw new ReviewStateError(
+          "invalid_request",
+          "loadRequestId must be a nonempty identifier.",
+          400,
+        );
+      contextPath(rawPath);
+      const previous = openLoads.get(id);
+      if (
+        previous &&
+        (previous.documentPath !== targetPath ||
+          Boolean(previous.reviewContext) !== Boolean(accepted) ||
+          (accepted &&
+            previous.reviewContext &&
+            !sameContext(accepted, previous.reviewContext)))
+      )
+        throw new ReviewStateError(
+          "stale_context",
+          "This opening ID is already bound to another document or review.",
+        );
+      load = previous ?? {
+        id,
+        documentPath: targetPath,
+        createdAt: Date.now(),
+        status: "opening",
+        ...(accepted
+          ? {
+              reviewContext: parseReviewContext(accepted),
+              journalId: getReviewStore().journalId,
+            }
+          : {}),
+      };
+      if (!previous) {
+        for (const [key, entry] of openLoads)
+          if (Date.now() - entry.createdAt > 15 * 60_000) openLoads.delete(key);
+        if (openLoads.size >= 256)
+          throw new ReviewStateError(
+            "receipt_unavailable",
+            "Too many browser opening requests; retry later.",
+            503,
+          );
+        openLoads.set(id, load);
+      }
+      let url: URL;
+      try {
+        url = new URL(targetUrl);
+      } catch {
+        throw new ReviewStateError(
+          "invalid_request",
+          "A browser opening needs an absolute URL.",
+          400,
+        );
+      }
+      url.searchParams.set("openRequest", id);
+      if (accepted) {
+        url.searchParams.set("journalId", getReviewStore().journalId);
+        url.searchParams.set(
+          "reviewContext",
+          JSON.stringify(parseReviewContext(accepted)),
+        );
+      }
+      targetUrl = url.toString();
+    }
     const matchingClient = Array.from(openRequestClients)
       .reverse()
       .find(
@@ -1143,17 +1349,19 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       );
     let delivered = false;
     if (
+      req.body?.notify !== false &&
       matchingClient &&
       accepted?.status !== "completed" &&
       accepted?.status !== "retired"
     ) {
       matchingClient.response.write(
-        `event: open-request\ndata: ${JSON.stringify({ path: targetPath, url: targetUrl, ...(accepted ? { reviewContext: accepted } : {}) })}\n\n`,
+        `event: open-request\ndata: ${JSON.stringify({ path: targetPath, url: targetUrl, ...(accepted ? { reviewContext: accepted, journalId: getReviewStore().journalId } : {}), ...(load ? { loadRequestId: load.id } : {}) })}\n\n`,
       );
       delivered = true;
     }
     res.json({
       delivered,
+      ...(load ? { load, url: targetUrl } : {}),
       ...(accepted
         ? { context: accepted, ...getReviewStore().snapshot() }
         : {}),
@@ -1535,6 +1743,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       reviewEvents.close();
       for (const client of openRequestClients) client.response.end();
       openRequestClients.clear();
+      openLoads.clear();
       clearInterval(remoteSessionSweeper);
       reviewStore?.close();
     },

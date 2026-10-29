@@ -89,11 +89,47 @@ describe("cli", () => {
     projectDir = path.join(tempDir, "project");
     devFrontendStateFile = path.join(tempDir, "dev-frontend.json");
     fs.mkdirSync(projectDir, { recursive: true });
+    mockLoads.clear();
     nextPid = 1000;
     runningPids = new Set<number>();
     serverByPid = new Map<number, StartedServer>();
     portByPid = new Map<number, number>();
   });
+
+  const mockLoads = new Map<
+    string,
+    { id: string; documentPath: string; status: string; version: string }
+  >();
+  function openingResponse(
+    url: URL,
+    init?: RequestInit,
+    delivered = false,
+  ): Response | null {
+    if (url.pathname === "/api/open-request" && init?.method === "POST") {
+      const body = JSON.parse(String(init.body));
+      const target = new URL(body.url);
+      target.searchParams.set("openRequest", body.loadRequestId);
+      const load = {
+        id: body.loadRequestId,
+        documentPath: fs.realpathSync(body.path),
+        status: "loaded",
+        version: "fixture-loaded-version",
+      };
+      mockLoads.set(load.id, load);
+      return Response.json({ delivered, url: target.toString(), load });
+    }
+    if (url.pathname === "/api/open-request/load")
+      return Response.json({
+        load: mockLoads.get(url.searchParams.get("id") ?? ""),
+      });
+    return null;
+  }
+  function withoutOpenId(value: string | null): string | null {
+    if (!value) return value;
+    const url = new URL(value);
+    url.searchParams.delete("openRequest");
+    return url.toString();
+  }
 
   function expectedOpenUrl(baseUrl: string, documentPath: string): string {
     const url = new URL(baseUrl);
@@ -267,7 +303,7 @@ describe("cli", () => {
 
     expect(exitCode).toBe(0);
     expect(test.getSpawnCount()).toBe(1);
-    expect(test.getLastOpenedUrl()).toBe(
+    expect(withoutOpenId(test.getLastOpenedUrl())).toBe(
       expectedOpenUrl(`http://localhost:${persisted.port}`, documentPath),
     );
     expect(fs.existsSync(getServerStateFilePath(test.deps.env))).toBeTruthy();
@@ -316,7 +352,7 @@ describe("cli", () => {
     const payload = parseOnlyJsonLog<{ opened: boolean }>(test.logs);
 
     expect(exitCode).toBe(0);
-    expect(payload.opened).toBe(true);
+    expect(payload.opened).toBe(false);
   });
 
   it("keeps the original command result when the update check fails", async () => {
@@ -363,6 +399,8 @@ describe("cli", () => {
           return new Response(
             JSON.stringify({
               backend: "local-files",
+              capabilities: { reviewOpenLoad: 1 },
+              reviewEvents: { journalId: "fixture-journal", latestSequence: 0 },
               port: ROUGHDRAFT_DEFAULT_PORT,
               projectDir,
               serverRoot,
@@ -376,12 +414,13 @@ describe("cli", () => {
 
         if (url.pathname === "/api/open-request" && init?.method === "POST") {
           postedOpenRequest = JSON.parse(String(init.body));
-          return new Response(JSON.stringify({ delivered: true }), {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          });
+          const response = openingResponse(url, init, true);
+          if (!response) throw new Error("Expected a fixture opening response");
+          return response;
         }
 
+        const opening = openingResponse(url, init);
+        if (opening) return opening;
         throw new Error("connect ECONNREFUSED");
       },
       isProcessRunning: () => false,
@@ -400,7 +439,7 @@ describe("cli", () => {
     const exitCode = await runCli(["open", documentPath, "--no-watch"], deps);
 
     expect(exitCode).toBe(0);
-    expect(postedOpenRequest).toEqual({
+    expect(postedOpenRequest).toMatchObject({
       path: documentPath,
       url: expectedOpenUrl(
         `http://localhost:${ROUGHDRAFT_DEFAULT_PORT}`,
@@ -590,13 +629,16 @@ describe("cli", () => {
     }>(test.logs);
 
     expect(exitCode).toBe(0);
-    expect(payload).toEqual({
-      opened: true,
-      url: expectedOpenUrl(`http://localhost:${persisted.port}`, documentPath),
+    expect(payload).toMatchObject({
+      opened: false,
+      loaded: false,
       serverUrl: `http://localhost:${persisted.port}`,
       path: documentPath,
       openMode: "disabled",
     });
+    expect(withoutOpenId(payload.url)).toBe(
+      expectedOpenUrl(`http://localhost:${persisted.port}`, documentPath),
+    );
   });
 
   it("prefers the live dev frontend URL when it matches this checkout", async () => {
@@ -637,10 +679,15 @@ describe("cli", () => {
                 "http://localhost",
               );
 
-        if (url.pathname === "/api/status" && url.port === "5173") {
+        if (
+          url.pathname === "/api/status" &&
+          ["5173", "3000"].includes(url.port)
+        ) {
           return new Response(
             JSON.stringify({
               backend: "local-files",
+              capabilities: { reviewOpenLoad: 1 },
+              reviewEvents: { journalId: "fixture-journal", latestSequence: 0 },
               projectDir,
               serverRoot,
             }),
@@ -651,6 +698,8 @@ describe("cli", () => {
           );
         }
 
+        const opening = openingResponse(url, init);
+        if (opening) return opening;
         return fetch(input, init);
       },
       spawnServerProcess: async () => {
@@ -679,7 +728,7 @@ describe("cli", () => {
 
     expect(exitCode).toBe(0);
     expect(spawnCount).toBe(0);
-    expect(lastOpenedUrl).toBe(
+    expect(withoutOpenId(lastOpenedUrl)).toBe(
       expectedOpenUrl("http://localhost:5173", documentPath),
     );
   });
@@ -714,7 +763,7 @@ describe("cli", () => {
         ROUGHDRAFT_DEV_FRONTEND_STATE_FILE: devFrontendStateFile,
       },
       cwd: projectDir,
-      fetchImpl: async (input, _init) => {
+      fetchImpl: async (input, init) => {
         const url =
           input instanceof URL
             ? input
@@ -723,10 +772,15 @@ describe("cli", () => {
                 "http://localhost",
               );
 
-        if (url.pathname === "/api/status" && url.port === "5173") {
+        if (
+          url.pathname === "/api/status" &&
+          ["5173", "3000"].includes(url.port)
+        ) {
           return new Response(
             JSON.stringify({
               backend: "local-files",
+              capabilities: { reviewOpenLoad: 1 },
+              reviewEvents: { journalId: "fixture-journal", latestSequence: 0 },
               port: 3000,
               projectDir,
               serverRoot,
@@ -753,6 +807,8 @@ describe("cli", () => {
           );
         }
 
+        const opening = openingResponse(url, init);
+        if (opening) return opening;
         throw new Error(`Unexpected request: ${url.toString()}`);
       },
       spawnServerProcess: async () => {
@@ -777,7 +833,7 @@ describe("cli", () => {
 
     expect(exitCode).toBe(0);
     expect(spawnCount).toBe(0);
-    expect(lastOpenedUrl).toBe(
+    expect(withoutOpenId(lastOpenedUrl)).toBe(
       expectedOpenUrl("http://localhost:5173", documentPath),
     );
     expect(watchUrl).toBe("http://localhost:3000/api/review-events/watch");
@@ -813,12 +869,12 @@ describe("cli", () => {
 
     expect(exitCode).toBe(0);
     expect(test.getSpawnCount()).toBe(1);
-    expect(test.getLastOpenedUrl()).toBe(
+    expect(withoutOpenId(test.getLastOpenedUrl())).toBe(
       expectedOpenUrl(`http://localhost:${persisted.port}`, documentPath),
     );
   });
 
-  it("uses the preview-web frontend URL when that workflow is active", async () => {
+  it("refuses an unverified preview-web opening without a file API", async () => {
     const documentPath = path.join(projectDir, "draft.md");
     fs.writeFileSync(documentPath, "# Draft\n");
     fs.writeFileSync(
@@ -847,7 +903,7 @@ describe("cli", () => {
         ROUGHDRAFT_DEV_FRONTEND_STATE_FILE: devFrontendStateFile,
       },
       cwd: projectDir,
-      fetchImpl: async (input) => {
+      fetchImpl: async (input, _init) => {
         const url =
           input instanceof URL
             ? input
@@ -881,11 +937,9 @@ describe("cli", () => {
 
     const exitCode = await runCli(["open", documentPath, "--no-watch"], deps);
 
-    expect(exitCode).toBe(0);
+    expect(exitCode).toBe(1);
     expect(spawnCount).toBe(0);
-    expect(lastOpenedUrl).toBe(
-      expectedOpenUrl("http://localhost:5174", documentPath),
-    );
+    expect(lastOpenedUrl).toBeNull();
   });
 
   it("rejects missing markdown files before opening", async () => {
@@ -1153,7 +1207,7 @@ describe("cli", () => {
         ROUGHDRAFT_STATE_DIR: stateDir,
       },
       cwd: projectDir,
-      fetchImpl: async (input) => {
+      fetchImpl: async (input, init) => {
         const url =
           input instanceof URL
             ? input
@@ -1169,6 +1223,8 @@ describe("cli", () => {
           return new Response(
             JSON.stringify({
               backend: "local-files",
+              capabilities: { reviewOpenLoad: 1 },
+              reviewEvents: { journalId: "fixture-journal", latestSequence: 0 },
               port: ROUGHDRAFT_DEFAULT_PORT,
               projectDir,
               serverRoot,
@@ -1180,6 +1236,8 @@ describe("cli", () => {
           );
         }
 
+        const opening = openingResponse(url, init);
+        if (opening) return opening;
         throw new Error("connect ECONNREFUSED");
       },
       isProcessRunning: () => false,
@@ -1246,7 +1304,7 @@ describe("cli", () => {
         ROUGHDRAFT_STATE_DIR: stateDir,
       },
       cwd: projectDir,
-      fetchImpl: async (input) => {
+      fetchImpl: async (input, init) => {
         const url =
           input instanceof URL
             ? input
@@ -1262,6 +1320,8 @@ describe("cli", () => {
           return new Response(
             JSON.stringify({
               backend: "local-files",
+              capabilities: { reviewOpenLoad: 1 },
+              reviewEvents: { journalId: "fixture-journal", latestSequence: 0 },
               port: ROUGHDRAFT_DEFAULT_PORT,
               projectDir,
               serverRoot,
@@ -1273,6 +1333,8 @@ describe("cli", () => {
           );
         }
 
+        const opening = openingResponse(url, init);
+        if (opening) return opening;
         throw new Error("connect ECONNREFUSED");
       },
       isProcessRunning: () => false,
@@ -1305,7 +1367,7 @@ describe("cli", () => {
         ROUGHDRAFT_STATE_DIR: stateDir,
       },
       cwd: projectDir,
-      fetchImpl: async (input) => {
+      fetchImpl: async (input, init) => {
         const url =
           input instanceof URL
             ? input
@@ -1322,6 +1384,8 @@ describe("cli", () => {
           return new Response(
             JSON.stringify({
               backend: "local-files",
+              capabilities: { reviewOpenLoad: 1 },
+              reviewEvents: { journalId: "fixture-journal", latestSequence: 0 },
               pid: 4242,
               port: ROUGHDRAFT_DEFAULT_PORT,
               projectDir,
@@ -1334,6 +1398,8 @@ describe("cli", () => {
           );
         }
 
+        const opening = openingResponse(url, init);
+        if (opening) return opening;
         throw new Error("connect ECONNREFUSED");
       },
       isProcessRunning: (pid) => unmanagedRunning && pid === 4242,
@@ -1482,7 +1548,7 @@ describe("cli", () => {
       "  roughdraft open <path> [--no-open] [--no-watch] [--print-url] [--port <port>]",
     );
     expect(test.logs).toContain(
-      "  --no-watch           Open the file without waiting",
+      "  --no-watch           Return after verified load, without waiting for Done",
     );
     expect(test.logs).toContain(
       "  --timeout <seconds>  Maximum watch time; omitted means no timeout",
@@ -1680,7 +1746,7 @@ describe("cli", () => {
         ROUGHDRAFT_STATE_DIR: stateDir,
       },
       cwd: projectDir,
-      fetchImpl: async (input) => {
+      fetchImpl: async (input, _init) => {
         const url =
           input instanceof URL
             ? input
@@ -1697,6 +1763,8 @@ describe("cli", () => {
           return new Response(
             JSON.stringify({
               backend: "local-files",
+              capabilities: { reviewOpenLoad: 1 },
+              reviewEvents: { journalId: "fixture-journal", latestSequence: 0 },
               port: ROUGHDRAFT_DEFAULT_PORT,
               projectDir: path.join(tempDir, "other-project"),
               serverRoot: otherServerRoot,
@@ -1712,6 +1780,8 @@ describe("cli", () => {
           return new Response(
             JSON.stringify({
               backend: "local-files",
+              capabilities: { reviewOpenLoad: 1 },
+              reviewEvents: { journalId: "fixture-journal", latestSequence: 0 },
               port: ROUGHDRAFT_DEFAULT_PORT + 1,
               projectDir,
               serverRoot,

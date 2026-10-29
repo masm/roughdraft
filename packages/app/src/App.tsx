@@ -57,10 +57,19 @@ import { PreviewBackend } from "./preview-backend";
 import { RoughdraftFormatDemo } from "./RoughdraftFormatDemo";
 import {
   type CompleteReviewOptions,
+  type CompleteReviewResult,
+  requireSavedPage,
   MarkdownFileConflictError,
   type Page,
   type StorageBackend,
 } from "./storage";
+import {
+  parseReviewContext,
+  requestedReviewFromUrl,
+  sameRequestedReview,
+  type RequestedReview,
+  type ReviewBinding,
+} from "./review-context";
 import { UpdateNotice } from "./UpdateNotice";
 import { fetchUpdateStatus, type UpdateStatus } from "./update-status";
 
@@ -68,7 +77,8 @@ export type DocumentDiskChangeState =
   | "clean"
   | "changed"
   | "conflict"
-  | "paused";
+  | "paused"
+  | "unavailable";
 
 export function shouldWarnBeforeUnload({
   activeDocumentPath,
@@ -1487,13 +1497,18 @@ export function App() {
   );
   const [documentSaveState, setDocumentSaveState] =
     useState<DocumentSaveState>("saved");
-  const [documentDiskChangeState, setDocumentDiskChangeState] =
+  const [documentDiskChangeState, updateDocumentDiskChangeState] =
     useState<DocumentDiskChangeState>("clean");
   const [documentForceResetKey, setDocumentForceResetKey] = useState<
     string | null
   >(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [documentProblem, setDocumentProblem] = useState<string | null>(null);
+  const [reviewBinding, setReviewBinding] = useState<ReviewBinding | null>(
+    null,
+  );
+  const [reviewReady, updateReviewReady] = useState(false);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
   const [documentEditorViewMode, setDocumentEditorViewMode] = useState(() =>
     getDocumentEditorViewModeFromLocation("rich-text"),
@@ -1504,6 +1519,50 @@ export function App() {
   const documentDirtyRef = useRef(false);
   const documentSaveStateRef = useRef<DocumentSaveState>("saved");
   const documentDraftContentRef = useRef<string | null>(null);
+  const reviewBindingRef = useRef<ReviewBinding | null>(null);
+  const reviewReadyRef = useRef(false);
+  const loadRevisionRef = useRef(0);
+  const lifecycleRef = useRef(0);
+  const latestVerifiedReviewRef = useRef<ReviewBinding | null>(null);
+  const pendingOpeningRef = useRef<{
+    review?: RequestedReview;
+    loadRequestId?: string;
+  }>({});
+  const pendingSaveRef = useRef<Promise<unknown>>(Promise.resolve());
+  const completedReviewRef = useRef<RequestedReview | null>(null);
+  const pendingCompletionRef = useRef<{
+    backend: StorageBackend;
+    path: string;
+    binding: ReviewBinding;
+    revision: number;
+    options: CompleteReviewOptions;
+  } | null>(null);
+  const pendingSaveContentRef = useRef<{
+    path: string;
+    content: string;
+  } | null>(null);
+  const setReviewReady = useCallback((ready: boolean) => {
+    reviewReadyRef.current = ready;
+    updateReviewReady(ready);
+  }, []);
+  useEffect(() => {
+    lifecycleRef.current += 1;
+    return () => {
+      lifecycleRef.current += 1;
+      loadRevisionRef.current += 1;
+    };
+  }, []);
+  const contentRevisionRef = useRef(0);
+  const refreshRevisionRef = useRef(0);
+  const documentDiskChangeStateRef = useRef<DocumentDiskChangeState>("clean");
+  const revalidateDocumentRef = useRef<() => void>(() => {});
+  const setDocumentDiskChangeState = useCallback(
+    (state: DocumentDiskChangeState) => {
+      documentDiskChangeStateRef.current = state;
+      updateDocumentDiskChangeState(state);
+    },
+    [],
+  );
 
   backendRef.current = backend;
   documentPageRef.current = documentPage;
@@ -1511,20 +1570,153 @@ export function App() {
   documentSaveStateRef.current = documentSaveState;
 
   const applyDocumentPage = useCallback((nextDocument: Page) => {
+    documentPageRef.current = nextDocument;
     setDocumentPage(nextDocument);
     documentDraftContentRef.current = nextDocument.content;
   }, []);
 
   const loadDocument = useCallback(
-    async (nextBackend: StorageBackend, relativePath: string) => {
-      const nextDocument = await nextBackend.getMarkdownFile(relativePath);
-      applyDocumentPage(nextDocument);
-      setActiveDocumentPath(relativePath);
-      documentDirtyRef.current = false;
-      setDocumentDiskChangeState("clean");
-      return nextDocument;
+    async (
+      nextBackend: StorageBackend,
+      relativePath: string,
+      opening: {
+        review?: RequestedReview;
+        loadRequestId?: string;
+        discardDraft?: boolean;
+      } = {},
+    ) => {
+      const lifecycle = lifecycleRef.current;
+      let epoch: number | undefined;
+      try {
+        const acceptedContext =
+          (await nextBackend.getReviewContext?.(
+            relativePath,
+            opening.review?.journalId,
+          )) ?? null;
+        const accepted =
+          !opening.review && acceptedContext?.status === "completed"
+            ? null
+            : acceptedContext;
+        if (lifecycle !== lifecycleRef.current)
+          throw new Error("This document view was replaced.");
+        if (opening.review && !sameRequestedReview(opening.review, accepted))
+          throw new Error("This opening context is no longer current.");
+        const latest = latestVerifiedReviewRef.current;
+        if (
+          accepted &&
+          latest &&
+          latest.documentPath === accepted.documentPath &&
+          latest.reviewContext.storeId === accepted.reviewContext.storeId &&
+          latest.reviewContext.generation > accepted.reviewContext.generation
+        )
+          throw new Error("A newer review already owns this document view.");
+        if (accepted) latestVerifiedReviewRef.current = accepted;
+        epoch = ++loadRevisionRef.current;
+        refreshRevisionRef.current += 1;
+        const revision = contentRevisionRef.current;
+        pendingOpeningRef.current = opening;
+        setReviewReady(false);
+        const nextDocument = await nextBackend.getMarkdownFile(relativePath);
+        const confirmedContext =
+          (await nextBackend.getReviewContext?.(
+            relativePath,
+            accepted?.journalId ?? opening.review?.journalId,
+          )) ?? null;
+        const confirmed =
+          !opening.review && confirmedContext?.status === "completed"
+            ? null
+            : confirmedContext;
+        if (
+          !sameRequestedReview(accepted, confirmed) ||
+          accepted?.documentPath !== confirmed?.documentPath
+        )
+          throw new Error(
+            "The opening context changed while the document loaded.",
+          );
+        if (
+          epoch !== loadRevisionRef.current ||
+          lifecycle !== lifecycleRef.current
+        )
+          throw new Error("A newer opening replaced this document load.");
+        if (
+          revision !== contentRevisionRef.current ||
+          (!opening.discardDraft && documentDirtyRef.current)
+        ) {
+          setDocumentDiskChangeState("changed");
+          throw new Error(
+            "Your local draft was preserved. Reload or resolve it before loading this review.",
+          );
+        }
+        if ((accepted || opening.loadRequestId) && !nextDocument.version)
+          throw new Error("The loaded file did not include a saved version.");
+        if (nextDocument.version)
+          await nextBackend.acknowledgeReviewContext?.(
+            relativePath,
+            nextDocument.version,
+            accepted,
+            opening.loadRequestId,
+          );
+        if (
+          epoch !== loadRevisionRef.current ||
+          lifecycle !== lifecycleRef.current ||
+          revision !== contentRevisionRef.current
+        )
+          throw new Error(
+            "The document changed before load acknowledgment completed.",
+          );
+        applyDocumentPage(nextDocument);
+        activeDocumentPathRef.current = relativePath;
+        setActiveDocumentPath(relativePath);
+        const loaded = accepted
+          ? {
+              ...accepted,
+              status:
+                accepted.status === "completed"
+                  ? ("completed" as const)
+                  : ("loaded" as const),
+            }
+          : null;
+        if (!sameRequestedReview(reviewBindingRef.current, loaded)) {
+          pendingCompletionRef.current = null;
+          completedReviewRef.current = null;
+        }
+        reviewBindingRef.current = loaded;
+        if (loaded?.status === "completed") completedReviewRef.current = loaded;
+        setReviewBinding(loaded);
+        documentDirtyRef.current = false;
+        setDocumentProblem(null);
+        setDocumentDiskChangeState("clean");
+        setReviewReady(true);
+        return nextDocument;
+      } catch (error) {
+        if (
+          epoch !== undefined &&
+          epoch === loadRevisionRef.current &&
+          lifecycle === lifecycleRef.current
+        ) {
+          setReviewReady(false);
+          setDocumentProblem(
+            error instanceof Error
+              ? error.message
+              : "The document could not load.",
+          );
+          if (documentDiskChangeStateRef.current === "clean")
+            setDocumentDiskChangeState("unavailable");
+        }
+        if (opening.loadRequestId)
+          await nextBackend
+            .reportOpenFailure?.(
+              relativePath,
+              opening.loadRequestId,
+              error instanceof Error
+                ? error.message
+                : "The document could not load.",
+            )
+            .catch(() => undefined);
+        throw error;
+      }
     },
-    [applyDocumentPage],
+    [applyDocumentPage, setDocumentDiskChangeState, setReviewReady],
   );
 
   useEffect(() => {
@@ -1552,20 +1744,66 @@ export function App() {
 
     const source = new EventSource(`${sourceUrl.pathname}${sourceUrl.search}`);
     const handleOpenRequest = (event: Event) => {
-      try {
+      void (async () => {
         const payload = JSON.parse((event as MessageEvent<string>).data) as {
           url?: unknown;
+          path?: unknown;
+          journalId?: unknown;
+          reviewContext?: unknown;
+          loadRequestId?: unknown;
         };
         if (typeof payload.url !== "string" || !payload.url.trim()) return;
-
+        const nextBackend = backendRef.current;
+        const currentPath = activeDocumentPathRef.current;
+        if (!nextBackend || !currentPath) return;
         const nextUrl = new URL(payload.url, window.location.origin);
-        window.focus();
-        if (nextUrl.href !== window.location.href) {
+        const review =
+          payload.reviewContext === undefined
+            ? requestedReviewFromUrl(nextUrl)
+            : {
+                journalId: String(payload.journalId ?? ""),
+                reviewContext: parseReviewContext(payload.reviewContext),
+              };
+        const loadRequestId =
+          typeof payload.loadRequestId === "string"
+            ? payload.loadRequestId
+            : (nextUrl.searchParams.get("openRequest") ?? undefined);
+        const nextPath = nextUrl.searchParams.get("path") ?? payload.path;
+        if (
+          nextPath !== requestedPathState.rawPath &&
+          nextUrl.href !== window.location.href &&
+          nextPath !== reviewBindingRef.current?.documentPath
+        ) {
+          if (review) {
+            const accepted =
+              typeof nextPath === "string"
+                ? await nextBackend.getReviewContext?.(
+                    nextPath,
+                    review.journalId,
+                  )
+                : null;
+            if (!sameRequestedReview(review, accepted ?? null))
+              throw new Error("This opening context is no longer current.");
+          }
           window.location.assign(nextUrl.href);
+          return;
         }
-      } catch (error) {
-        console.error("Failed to handle Roughdraft open request:", error);
-      }
+        if (!review && !loadRequestId) {
+          revalidateDocumentRef.current();
+          return;
+        }
+        await loadDocument(nextBackend, currentPath, { review, loadRequestId });
+        if (!nextUrl.searchParams.has("editor")) {
+          const editor = new URL(window.location.href).searchParams.get(
+            "editor",
+          );
+          if (editor) nextUrl.searchParams.set("editor", editor);
+        }
+        window.history.replaceState(null, "", nextUrl.href);
+        window.focus();
+      })().catch((error) =>
+        console.error("Failed to handle Roughdraft open request:", error),
+      );
     };
 
     source.addEventListener("open-request", handleOpenRequest);
@@ -1574,7 +1812,7 @@ export function App() {
       source.removeEventListener("open-request", handleOpenRequest);
       source.close();
     };
-  }, [requestedPathState.rawPath]);
+  }, [requestedPathState.rawPath, loadDocument]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1588,6 +1826,7 @@ export function App() {
         const detectedBackend = await detectBackend();
         if (cancelled) return;
 
+        backendRef.current = detectedBackend;
         setBackend(detectedBackend);
 
         if (detectedBackend.info.kind === "remote") {
@@ -1622,7 +1861,11 @@ export function App() {
 
         if (cancelled) return;
 
-        await loadDocument(detectedBackend, requestedPathState.documentPath);
+        const url = new URL(window.location.href);
+        await loadDocument(detectedBackend, requestedPathState.documentPath, {
+          review: requestedReviewFromUrl(url),
+          loadRequestId: url.searchParams.get("openRequest") ?? undefined,
+        });
         if (cancelled) return;
 
         setLoading(false);
@@ -1670,43 +1913,97 @@ export function App() {
     requestedPathState.rawPath,
   ]);
 
+  const saveConfirmedDocument = useCallback(
+    (
+      currentBackend: StorageBackend,
+      currentPath: string,
+      content: string,
+      overwrite = false,
+    ) => {
+      const epoch = loadRevisionRef.current;
+      const binding = reviewBindingRef.current;
+      const save = pendingSaveRef.current
+        .catch(() => undefined)
+        .then(async () => {
+          if (binding?.status === "completed")
+            throw new Error(
+              "This review is already complete. Open a fresh review before saving new feedback.",
+            );
+          if (
+            epoch !== loadRevisionRef.current ||
+            activeDocumentPathRef.current !== currentPath ||
+            !reviewReadyRef.current
+          )
+            throw new Error(
+              "This document context is no longer ready to save.",
+            );
+          if (!overwrite && documentDiskChangeStateRef.current !== "clean")
+            throw new Error("Resolve the disk change before saving.");
+          const expectedVersion = overwrite
+            ? (await currentBackend.getMarkdownFile(currentPath)).version
+            : documentPageRef.current?.version;
+          pendingSaveContentRef.current = { path: currentPath, content };
+          try {
+            const response = binding
+              ? await currentBackend.saveMarkdownFile(
+                  currentPath,
+                  content,
+                  expectedVersion,
+                  binding,
+                )
+              : await currentBackend.saveMarkdownFile(
+                  currentPath,
+                  content,
+                  expectedVersion,
+                );
+            const saved = requireSavedPage(response, content);
+            if (currentBackend.info.kind !== "local-storage" && !saved.version)
+              throw new Error("The save did not confirm a saved file version.");
+            if (
+              epoch !== loadRevisionRef.current ||
+              activeDocumentPathRef.current !== currentPath
+            )
+              throw new Error("A newer opening replaced this save.");
+            return saved;
+          } catch (error) {
+            if (error instanceof MarkdownFileConflictError)
+              setDocumentDiskChangeState("conflict");
+            throw error;
+          } finally {
+            pendingSaveContentRef.current = null;
+          }
+        });
+      pendingSaveRef.current = save;
+      return save;
+    },
+    [setDocumentDiskChangeState],
+  );
+
   const handleSaveDocument = useCallback(
     async (id: string, content: string) => {
-      if (!activeDocumentPath) return;
-      const expectedVersion =
-        documentPageRef.current?.id === id
-          ? documentPageRef.current.version
-          : undefined;
-
-      let savedDocument: Page | undefined;
-      try {
-        savedDocument = await backendRef.current?.saveMarkdownFile(
-          activeDocumentPath,
-          content,
-          expectedVersion,
-        );
-      } catch (error) {
-        if (error instanceof MarkdownFileConflictError) {
-          setDocumentDiskChangeState("conflict");
-        }
-        throw error;
-      }
-
-      const firstLine = content.split("\n")[0] || "";
-      const fallbackTitle = id.split("/").at(-1) || id;
-      const title = firstLine.replace(/^#*\s*/, "") || fallbackTitle;
-      const nextDocument = savedDocument ?? {
-        id,
+      const currentPath = activeDocumentPathRef.current;
+      const currentBackend = backendRef.current;
+      if (!currentPath || !currentBackend || documentPageRef.current?.id !== id)
+        throw new Error("The document backend is unavailable.");
+      const revision = contentRevisionRef.current;
+      const savedDocument = await saveConfirmedDocument(
+        currentBackend,
+        currentPath,
         content,
-        title,
-        version: expectedVersion,
-      };
-
-      applyDocumentPage(nextDocument);
+      );
+      if (contentRevisionRef.current !== revision) {
+        documentPageRef.current = savedDocument;
+        setDocumentPage(savedDocument);
+        return;
+      }
+      if (documentDiskChangeStateRef.current !== "clean")
+        throw new Error(
+          "The file changed while saving; your draft is preserved.",
+        );
+      applyDocumentPage(savedDocument);
       documentDirtyRef.current = false;
-      setDocumentDiskChangeState("clean");
     },
-    [activeDocumentPath, applyDocumentPage],
+    [applyDocumentPage, saveConfirmedDocument],
   );
 
   const handleDocumentDirtyStateChange = useCallback((isDirty: boolean) => {
@@ -1722,6 +2019,7 @@ export function App() {
   );
 
   const handleDocumentLocalContentChange = useCallback((markdown: string) => {
+    contentRevisionRef.current += 1;
     documentDraftContentRef.current = markdown;
   }, []);
 
@@ -1747,22 +2045,25 @@ export function App() {
   }, [documentDiskChangeState]);
 
   const handleReloadDocumentFromDisk = useCallback(async () => {
-    const currentBackend = backendRef.current;
-    const currentPath = activeDocumentPathRef.current;
+    const currentBackend = backendRef.current,
+      currentPath = activeDocumentPathRef.current;
     if (!currentBackend || !currentPath) return;
-
-    const nextDocument = await currentBackend.getMarkdownFile(currentPath);
-    applyDocumentPage(nextDocument);
-    documentDirtyRef.current = false;
-    setDocumentDiskChangeState("clean");
-    setDocumentForceResetKey(
-      `${currentPath}:${nextDocument.version ?? Date.now()}`,
-    );
-  }, [applyDocumentPage]);
+    try {
+      const nextDocument = await loadDocument(currentBackend, currentPath, {
+        ...pendingOpeningRef.current,
+        discardDraft: true,
+      });
+      setDocumentForceResetKey(
+        `${currentPath}:${nextDocument.version ?? Date.now()}:reload`,
+      );
+    } catch (error) {
+      console.error("Failed to reload the document:", error);
+    }
+  }, [loadDocument]);
 
   const handleKeepEditingWithoutAutosave = useCallback(() => {
     setDocumentDiskChangeState("paused");
-  }, []);
+  }, [setDocumentDiskChangeState]);
 
   const handleOverwriteDocumentOnDisk = useCallback(async () => {
     const currentBackend = backendRef.current;
@@ -1771,18 +2072,14 @@ export function App() {
     if (!currentBackend || !currentPath || !currentDocument) return;
 
     const content = documentDraftContentRef.current ?? currentDocument.content;
-    const firstLine = content.split("\n")[0] || "";
-    const fallbackTitle =
-      currentDocument.id.split("/").at(-1) || currentDocument.id;
-    const title = firstLine.replace(/^#*\s*/, "") || fallbackTitle;
-    const savedDocument = (await currentBackend.saveMarkdownFile(
+    const revision = contentRevisionRef.current;
+    const savedDocument = await saveConfirmedDocument(
+      currentBackend,
       currentPath,
       content,
-    )) ?? {
-      ...currentDocument,
-      content,
-      title,
-    };
+      true,
+    );
+    if (revision !== contentRevisionRef.current) return;
 
     applyDocumentPage(savedDocument);
     documentDirtyRef.current = false;
@@ -1791,97 +2088,273 @@ export function App() {
     setDocumentForceResetKey(
       `${currentPath}:${savedDocument.version ?? Date.now()}:overwrite`,
     );
-  }, [applyDocumentPage, handleDocumentSaveStateChange]);
+  }, [
+    applyDocumentPage,
+    handleDocumentSaveStateChange,
+    saveConfirmedDocument,
+    setDocumentDiskChangeState,
+  ]);
 
   const handleCompleteReview = useCallback(
     async (options?: CompleteReviewOptions) => {
       const currentBackend = backendRef.current;
       const currentPath = activeDocumentPathRef.current;
       const currentDocument = documentPageRef.current;
-      if (!currentBackend || !currentPath || !currentDocument) {
-        return { delivered: false };
+      if (!currentBackend || !currentPath || !currentDocument)
+        throw new Error("The document backend is unavailable.");
+      const finish = (
+        result: CompleteReviewResult,
+        binding: ReviewBinding | null,
+      ) => {
+        if (result.recorded && binding) completedReviewRef.current = binding;
+        pendingCompletionRef.current = null;
+        return result;
+      };
+      const currentBinding = reviewBindingRef.current;
+      if (currentBinding?.status === "completed") {
+        if (documentDirtyRef.current)
+          throw new Error(
+            "Your new draft is preserved; open a fresh review to save it.",
+          );
+        const receipt = await currentBackend.getReviewReceipt?.(
+          currentPath,
+          currentBinding,
+        );
+        if (receipt?.recorded) return finish(receipt, currentBinding);
+        throw new Error("The completed review receipt could not be verified.");
       }
-
+      const pending = pendingCompletionRef.current;
+      if (
+        pending &&
+        pending.backend === currentBackend &&
+        pending.path === currentPath &&
+        sameRequestedReview(pending.binding, reviewBindingRef.current)
+      ) {
+        if (
+          (options?.overallComment?.trim() ?? "") !==
+          (pending.options.overallComment?.trim() ?? "")
+        )
+          throw new Error(
+            "Your changed overall comment is preserved. Reconcile the earlier handoff before sending different feedback.",
+          );
+        if (
+          pending.revision !== contentRevisionRef.current ||
+          documentDirtyRef.current
+        )
+          throw new Error(
+            "Your new draft is preserved. Reconcile the previous completion before starting another review.",
+          );
+        const receipt = await currentBackend.getReviewReceipt?.(
+          currentPath,
+          pending.binding,
+        );
+        if (receipt?.recorded) return finish(receipt, pending.binding);
+        if (!currentBackend.completeReview)
+          throw new Error("The review completion backend is unavailable.");
+        return finish(
+          await currentBackend.completeReview(currentPath, pending.options),
+          pending.binding,
+        );
+      }
+      if (
+        !reviewReadyRef.current ||
+        documentDiskChangeStateRef.current !== "clean"
+      )
+        throw new Error(
+          "Resolve the document load or disk change before completing this review.",
+        );
       const content =
         documentDraftContentRef.current ?? currentDocument.content;
-      const expectedVersion = currentDocument.version;
-      const firstLine = content.split("\n")[0] || "";
-      const fallbackTitle =
-        currentDocument.id.split("/").at(-1) || currentDocument.id;
-      const title = firstLine.replace(/^#*\s*/, "") || fallbackTitle;
-
-      const savedDocument = (await currentBackend.saveMarkdownFile(
+      const revision = contentRevisionRef.current;
+      const binding = reviewBindingRef.current;
+      const savedDocument = await saveConfirmedDocument(
+        currentBackend,
         currentPath,
         content,
-        expectedVersion,
-      )) ?? {
-        ...currentDocument,
-        content,
-        title,
-      };
-
+      );
+      if (
+        contentRevisionRef.current !== revision ||
+        activeDocumentPathRef.current !== currentPath ||
+        backendRef.current !== currentBackend ||
+        documentDiskChangeStateRef.current !== "clean"
+      )
+        throw new Error(
+          "The document changed while saving; the review remains unfinished.",
+        );
       applyDocumentPage(savedDocument);
       documentDirtyRef.current = false;
       setDocumentDiskChangeState("clean");
-
-      return currentBackend.completeReview
-        ? currentBackend.completeReview(currentPath, options)
-        : { delivered: false };
+      if (!currentBackend.completeReview) return { delivered: false };
+      const savedOptions =
+        currentBackend.info.kind === "local-storage"
+          ? options
+          : {
+              ...options,
+              expectedVersion: savedDocument.version,
+              ...(binding ? { reviewBinding: binding } : {}),
+            };
+      if (binding)
+        pendingCompletionRef.current = {
+          backend: currentBackend,
+          path: currentPath,
+          binding,
+          revision,
+          options: savedOptions ?? {},
+        };
+      return finish(
+        await currentBackend.completeReview(currentPath, savedOptions),
+        binding,
+      );
     },
-    [applyDocumentPage],
+    [applyDocumentPage, saveConfirmedDocument, setDocumentDiskChangeState],
   );
 
   useEffect(() => {
     if (!backend?.watchMarkdownFile || !activeDocumentPath) return;
-
     let disposed = false;
+    const refresh = async (event?: {
+      path: string;
+      exists: boolean;
+      version: string | null;
+    }) => {
+      if (disposed || (event && event.path !== activeDocumentPath)) return;
+      const request = ++refreshRevisionRef.current;
+      if (event && !event.exists) {
+        setDocumentProblem(
+          "The file is missing or unreadable. Your draft remains available.",
+        );
+        setDocumentDiskChangeState("unavailable");
+        return;
+      }
+      const revision = contentRevisionRef.current;
+      const original = documentPageRef.current;
+      if (
+        event?.version &&
+        original?.version === event.version &&
+        documentDiskChangeStateRef.current !== "unavailable"
+      )
+        return;
+      try {
+        const nextDocument = await backend.getMarkdownFile(activeDocumentPath);
+        if (
+          disposed ||
+          request !== refreshRevisionRef.current ||
+          backendRef.current !== backend ||
+          activeDocumentPathRef.current !== activeDocumentPath
+        )
+          return;
+        const pending = pendingSaveContentRef.current;
+        if (
+          pending?.path === activeDocumentPath &&
+          pending.content === nextDocument.content
+        )
+          return;
+        if (
+          nextDocument.version &&
+          nextDocument.version === documentPageRef.current?.version &&
+          documentDiskChangeStateRef.current !== "unavailable"
+        )
+          return;
+        if (
+          contentRevisionRef.current !== revision ||
+          documentDirtyRef.current ||
+          documentSaveStateRef.current === "saving" ||
+          documentDiskChangeStateRef.current === "paused"
+        ) {
+          setDocumentDiskChangeState(
+            documentDiskChangeStateRef.current === "paused"
+              ? "paused"
+              : "changed",
+          );
+          return;
+        }
+        const currentBinding =
+          (await backend.getReviewContext?.(
+            activeDocumentPath,
+            reviewBindingRef.current?.journalId,
+          )) ?? null;
+        if (
+          disposed ||
+          request !== refreshRevisionRef.current ||
+          contentRevisionRef.current !== revision
+        )
+          return;
+        const binding = reviewBindingRef.current;
+        if (
+          !currentBinding &&
+          binding &&
+          !sameRequestedReview(completedReviewRef.current, binding) &&
+          backend.getReviewReceipt
+        ) {
+          const receipt = await backend.getReviewReceipt(
+            activeDocumentPath,
+            binding,
+          );
+          if (
+            disposed ||
+            request !== refreshRevisionRef.current ||
+            contentRevisionRef.current !== revision
+          )
+            return;
+          if (receipt?.recorded) completedReviewRef.current = binding;
+        }
+        if (
+          !sameRequestedReview(binding, currentBinding) &&
+          !(
+            currentBinding === null &&
+            binding &&
+            sameRequestedReview(completedReviewRef.current, binding)
+          )
+        ) {
+          setReviewReady(false);
+          setDocumentProblem(
+            "A different review context now owns this file. Reopen the current review.",
+          );
+          setDocumentDiskChangeState("unavailable");
+          return;
+        }
+        if (
+          currentBinding?.status === "completed" &&
+          sameRequestedReview(binding, currentBinding)
+        ) {
+          reviewBindingRef.current = currentBinding;
+          setReviewBinding(currentBinding);
+          completedReviewRef.current = currentBinding;
+        }
+        applyDocumentPage(nextDocument);
+        setDocumentProblem(null);
+        setDocumentDiskChangeState("clean");
+      } catch (error) {
+        if (disposed || request !== refreshRevisionRef.current) return;
+        setDocumentProblem(
+          "The file is missing or unreadable. Your draft remains available.",
+        );
+        setDocumentDiskChangeState("unavailable");
+        console.error("Failed to reload changed markdown file:", error);
+      }
+    };
+    revalidateDocumentRef.current = () => {
+      void refresh();
+    };
     const stopWatching = backend.watchMarkdownFile(
       activeDocumentPath,
       (event) => {
-        if (disposed || event.path !== activeDocumentPath) return;
-
-        const currentDocument = documentPageRef.current;
-        if (event.version && currentDocument?.version === event.version) {
-          return;
-        }
-
-        if (!event.exists) {
-          setDocumentDiskChangeState("changed");
-          return;
-        }
-
-        if (documentDiskChangeState === "paused") {
-          return;
-        }
-
-        if (documentDirtyRef.current) {
-          setDocumentDiskChangeState("changed");
-          return;
-        }
-
-        void (async () => {
-          const currentBackend = backendRef.current;
-          const currentPath = activeDocumentPathRef.current;
-          if (!currentBackend || !currentPath || disposed) return;
-
-          try {
-            const nextDocument =
-              await currentBackend.getMarkdownFile(currentPath);
-            if (disposed) return;
-            applyDocumentPage(nextDocument);
-            setDocumentDiskChangeState("clean");
-          } catch (error) {
-            console.error("Failed to reload changed markdown file:", error);
-          }
-        })();
+        void refresh(event);
       },
     );
-
     return () => {
       disposed = true;
+      refreshRevisionRef.current += 1;
+      revalidateDocumentRef.current = () => {};
       stopWatching();
     };
-  }, [activeDocumentPath, applyDocumentPage, backend, documentDiskChangeState]);
+  }, [
+    activeDocumentPath,
+    applyDocumentPage,
+    backend,
+    setDocumentDiskChangeState,
+    setReviewReady,
+  ]);
 
   const handleDocumentEditorViewModeChange = useCallback(
     (nextMode: DocumentEditorViewMode) => {
@@ -1941,6 +2414,11 @@ export function App() {
         </div>
       ) : null}
       <DocumentWorkspace
+        reviewId={reviewBinding?.reviewContext.reviewId}
+        reviewActive={reviewBinding !== null}
+        reviewCompleted={reviewBinding?.status === "completed"}
+        reviewReady={reviewReady}
+        documentProblem={documentProblem}
         documentPage={documentPage}
         activeDocumentPath={activeDocumentPath}
         documentCopyPath={documentAbsolutePath}

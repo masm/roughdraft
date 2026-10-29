@@ -194,3 +194,9 @@ The most reliable long-term solution is a dedicated screenshot harness route or 
 - Capture both rich-text and code editor for document states that affect the editor surface or review rail.
   
 - Keep screenshots in `.context/` unless the run is intentionally being committed as visual documentation.
+
+## Durable review handoff states
+
+Capture scoped review loading (Done disabled until file/context acknowledgment), an ordinary approved/no-change round, a completed receipt with its agent disconnected (Saved and recoverable), and a fresh second round on the same path (Approve again). Include a lost-response retry that recovers the existing receipt without another comment.
+
+Capture an unavailable/missing file with the draft still visible and autosave/Done paused; restoration or Reload should recover the view. Keep the existing dirty-conflict, reload, explicit overwrite and keep-editing captures. A stale opening/context error preserves the current draft and explains that the current review must be reopened. Store new runs under the existing `.context/ui-state-screenshots/` convention.

@@ -1,3 +1,4 @@
+import type { ReviewBinding } from "./review-context";
 export interface Page {
   id: string;
   title: string;
@@ -29,10 +30,13 @@ export interface StoredAsset {
 
 export interface CompleteReviewResult {
   delivered: boolean;
+  recorded?: boolean;
 }
 
 export interface CompleteReviewOptions {
   overallComment?: string;
+  expectedVersion?: string;
+  reviewBinding?: ReviewBinding;
 }
 
 export interface ReviewWatchStatus {
@@ -57,7 +61,23 @@ export interface StorageBackend {
     relativePath: string,
     content: string,
     expectedVersion?: string,
-  ): Promise<Page | undefined>;
+    reviewBinding?: ReviewBinding,
+  ): Promise<Page>;
+  getReviewContext?(
+    relativePath: string,
+    journalId?: string,
+  ): Promise<ReviewBinding | null>;
+  acknowledgeReviewContext?(
+    relativePath: string,
+    version: string,
+    binding?: ReviewBinding | null,
+    loadRequestId?: string,
+  ): Promise<void>;
+  reportOpenFailure?(
+    relativePath: string,
+    loadRequestId: string,
+    error: string,
+  ): Promise<void>;
   watchMarkdownFile?(
     relativePath: string,
     onChange: (event: MarkdownFileChangeEvent) => void,
@@ -66,8 +86,29 @@ export interface StorageBackend {
     relativePath: string,
     options?: CompleteReviewOptions,
   ): Promise<CompleteReviewResult>;
+  getReviewReceipt?(
+    relativePath: string,
+    binding: ReviewBinding,
+  ): Promise<CompleteReviewResult | null>;
   getReviewWatchStatus?(relativePath: string): Promise<ReviewWatchStatus>;
   saveAsset(file: File): Promise<StoredAsset>;
   resolveFileUrl(path: string): string | null;
   openProject(path: string): Promise<void>;
+}
+
+export function requireSavedPage(value: unknown, content: string): Page {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    !("id" in value) ||
+    typeof value.id !== "string" ||
+    !("title" in value) ||
+    typeof value.title !== "string" ||
+    !("content" in value) ||
+    value.content !== content
+  )
+    throw new Error(
+      "Saving did not confirm the current document. The review remains unfinished.",
+    );
+  return value as Page;
 }

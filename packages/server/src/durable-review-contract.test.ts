@@ -961,3 +961,29 @@ it("preserves an external edit that arrives while preparing the replacement", as
   expect(completed.body.code).toBe("save_conflict");
   expect(fs.readFileSync(file, "utf8")).toBe("# External edit before write\n");
 });
+
+it("rejects an explicit unscoped completion version after a second edit following save", async () => {
+  const value = application();
+  const loaded = await request(value.app)
+    .get("/api/markdown-file")
+    .query({ projectPath: projectDir, path: "draft.md" });
+  const saved = await request(value.app)
+    .put("/api/markdown-file")
+    .query({ projectPath: projectDir, path: "draft.md" })
+    .send({
+      content: "# Confirmed saved bytes\n",
+      expectedVersion: loaded.body.version,
+    });
+  expect(saved.status).toBe(200);
+  expect(saved.body.content).toBe("# Confirmed saved bytes\n");
+  fs.writeFileSync(file, "# Second external edit\n");
+  const completed = await request(value.app).post("/api/review-events").send({
+    projectPath: projectDir,
+    path: "draft.md",
+    expectedVersion: saved.body.version,
+    overallComment: "Must not attach to the second edit.",
+  });
+  expect(completed.status).toBe(409);
+  expect(completed.body.code).toBe("save_conflict");
+  expect(fs.readFileSync(file, "utf8")).toBe("# Second external edit\n");
+});

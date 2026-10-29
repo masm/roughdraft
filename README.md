@@ -3,6 +3,8 @@ A local-first markdown editor and viewer for working with AI.
 
 Requires Node.js 22.13.0 or newer; the local review journal uses the built-in `node:sqlite` module.
 
+This fork's `0.1.11-masm.1` release adds durable, round-specific local review handoffs for the AS integration. Use its tagged GitHub release artifact when the integration requires these capabilities; the upstream npm package is a separate release stream. The [local handoff contract](docs/spec/review-events.md) defines verified opening, scoped save/completion, restart recovery and CLI adapter flags. The existing npm publish workflow is restricted to Lex-Inc/roughdraft and does not publish this fork.
+
 {==Open one markdown file on your machine. Review it, comment on it, and suggest edits.==}{>>What does this mean?<<}{id="c3" by="user" at="2026-04-30T20:18:51.163Z"}{>>It means Roughdraft works with a normal local Markdown file: you open one .md file from your computer, read it in the app, leave inline comments, and propose edits that are saved back into the Markdown using CriticMarkup.<<}{id="c4" by="AI" at="2026-04-30T20:19:39.000Z" re="c3"}{>>cjool<<}{id="c5" by="user" at="2026-05-07T20:38:25.621Z" re="c4"}
 
 Paste this into your coding agent:

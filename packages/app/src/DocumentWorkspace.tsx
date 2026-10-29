@@ -46,14 +46,25 @@ import {
   PageCard,
 } from "./PageCard";
 import { RobotsHighFiveToy } from "./RobotsHighFiveToy";
-import type { CompleteReviewOptions, Page, StorageBackend } from "./storage";
+import type {
+  CompleteReviewOptions,
+  CompleteReviewResult,
+  Page,
+  StorageBackend,
+} from "./storage";
 import { useReviewLayoutShiftAnimation } from "./useReviewLayoutShiftAnimation";
 
-type DiskChangeState = "clean" | "changed" | "conflict" | "paused";
+type DiskChangeState =
+  | "clean"
+  | "changed"
+  | "conflict"
+  | "paused"
+  | "unavailable";
 type ReviewHandoffState =
   | "idle"
   | "notifying"
   | "notified"
+  | "recorded"
   | "undelivered"
   | "error";
 type FileCopyAction = "path" | "filename" | "markdown" | "rich-text";
@@ -128,6 +139,10 @@ const conflictNoticeCopy: Record<
     body: string;
   }
 > = {
+  unavailable: {
+    title: "File unavailable",
+    body: "The file is missing, unreadable, or its review context could not be verified. Your draft remains visible; autosave and Done Reviewing are paused.",
+  },
   changed: {
     title: "File changed on disk",
     body: "Roughdraft found a newer version of this file on disk. Reload to use that version, or overwrite it with your current draft.",
@@ -231,6 +246,13 @@ function getSaveStatusViewModel(
   saveState: DocumentSaveState,
   diskChangeState: DiskChangeState,
 ) {
+  if (diskChangeState === "unavailable")
+    return {
+      label: "File unavailable",
+      ariaLabel: "File unavailable",
+      tone: "danger" as const,
+      Icon: AlertTriangle,
+    };
   if (diskChangeState === "conflict") {
     return {
       label: "Save conflict",
@@ -344,7 +366,9 @@ export function isReviewHandoffDisabled({
   // pending save on click, so the agent still receives the latest content.
   return (
     saveState === "error" ||
-    reviewHandoffState !== "idle" ||
+    (reviewHandoffState !== "idle" &&
+      reviewHandoffState !== "error" &&
+      reviewHandoffState !== "undelivered") ||
     documentDiskChangeState !== "clean"
   );
 }
@@ -356,6 +380,7 @@ export function getReviewHandoffButtonLabel({
   reviewHandoffState: ReviewHandoffState;
   documentChangedSinceOpen: boolean;
 }) {
+  if (reviewHandoffState === "recorded") return "Saved";
   return reviewHandoffState === "notifying"
     ? "Sending"
     : reviewHandoffState === "notified"
@@ -378,6 +403,11 @@ export function shouldLatchDocumentChangedSinceOpen({
 }
 
 interface DocumentWorkspaceProps {
+  reviewId?: string;
+  reviewActive?: boolean;
+  reviewCompleted?: boolean;
+  reviewReady?: boolean;
+  documentProblem?: string | null;
   documentPage: Page | null;
   activeDocumentPath: string | null;
   documentCopyPath: string | null;
@@ -395,11 +425,16 @@ interface DocumentWorkspaceProps {
   onOverwriteDocumentOnDisk: () => void | Promise<void>;
   onCompleteReview: (
     options?: CompleteReviewOptions,
-  ) => Promise<{ delivered: boolean }>;
+  ) => Promise<CompleteReviewResult>;
   backend: StorageBackend | null;
 }
 
 export function DocumentWorkspace({
+  reviewId,
+  reviewActive = false,
+  reviewCompleted = false,
+  reviewReady = true,
+  documentProblem,
   documentPage,
   activeDocumentPath,
   documentCopyPath,
@@ -464,7 +499,7 @@ export function DocumentWorkspace({
   }, [documentPage?.content]);
 
   useEffect(() => {
-    const documentIdentity = `${activeDocumentPath ?? ""}:${documentPage?.id ?? ""}`;
+    const documentIdentity = `${activeDocumentPath ?? ""}:${documentPage?.id ?? ""}:${reviewId ?? ""}`;
     if (!documentIdentity) return;
     documentChangeTrackingReadyRef.current = false;
     setReviewHandoffState("idle");
@@ -474,7 +509,10 @@ export function DocumentWorkspace({
       documentChangeTrackingReadyRef.current = true;
     }, 0);
     return () => window.clearTimeout(readyTimer);
-  }, [activeDocumentPath, documentPage?.id]);
+  }, [activeDocumentPath, documentPage?.id, reviewId]);
+  useEffect(() => {
+    if (reviewCompleted && reviewId) setReviewHandoffState("recorded");
+  }, [reviewCompleted, reviewId]);
 
   useEffect(() => {
     if (!backend?.getReviewWatchStatus || !activeDocumentPath) {
@@ -580,8 +618,15 @@ export function DocumentWorkspace({
           throw flushResult.error;
         }
 
+        if (!reviewReady || documentDiskChangeState !== "clean")
+          throw new Error("Resolve this document before completing review.");
         const result = await onCompleteReview(options);
-        if (result.delivered) {
+        if (result.recorded && !result.delivered) {
+          setReviewWatcherCount(0);
+          setReviewHandoffState("recorded");
+          setOverallComment("");
+          setReviewHandoffPopoverOpen(true);
+        } else if (result.delivered) {
           setReviewWatcherCount(0);
           setReviewHandoffState("notified");
           setOverallComment("");
@@ -597,7 +642,13 @@ export function DocumentWorkspace({
         setReviewHandoffPopoverOpen(true);
       }
     },
-    [activeDocumentPath, onCompleteReview, reviewHandoffState],
+    [
+      activeDocumentPath,
+      onCompleteReview,
+      reviewHandoffState,
+      reviewReady,
+      documentDiskChangeState,
+    ],
   );
 
   const handleDocumentDirtyStateChange = useCallback(
@@ -675,7 +726,7 @@ export function DocumentWorkspace({
       : conflictNoticeCopy[documentDiskChangeState];
   const showReviewHandoffButton =
     !!activeDocumentPath &&
-    (reviewWatcherCount > 0 || reviewHandoffState !== "idle");
+    (reviewActive || reviewWatcherCount > 0 || reviewHandoffState !== "idle");
   const reviewHandoffButtonLabel = getReviewHandoffButtonLabel({
     reviewHandoffState,
     documentChangedSinceOpen,
@@ -687,17 +738,21 @@ export function DocumentWorkspace({
         ? AlertTriangle
         : null;
   const reviewHandoffStatusTitle =
-    reviewHandoffState === "undelivered"
-      ? "No agent is watching now"
-      : reviewHandoffState === "error"
-        ? "Could not notify agent"
-        : reviewCompleteTitle;
+    reviewHandoffState === "recorded"
+      ? "Review saved"
+      : reviewHandoffState === "undelivered"
+        ? "No agent is watching now"
+        : reviewHandoffState === "error"
+          ? "Could not notify agent"
+          : reviewCompleteTitle;
   const reviewHandoffStatusBody =
-    reviewHandoffState === "undelivered"
-      ? "The handoff was not delivered because the watcher is no longer connected."
-      : reviewHandoffState === "error"
-        ? "Roughdraft could not send the handoff. Check that the local server is still running."
-        : null;
+    reviewHandoffState === "recorded"
+      ? "The agent can recover this completed review when it reconnects."
+      : reviewHandoffState === "undelivered"
+        ? "The handoff was not delivered because the watcher is no longer connected."
+        : reviewHandoffState === "error"
+          ? "Roughdraft could not send the handoff. Check that the local server is still running."
+          : null;
   const reviewHandoffCopyMessage = buildReviewHandoffCopyMessage(
     activeDocumentPath ?? documentFilenameLabel,
   );
@@ -707,7 +762,10 @@ export function DocumentWorkspace({
     reviewHandoffState,
   });
   const reviewHandoffButtonDisabled =
-    reviewHandoffDisabled && reviewHandoffState !== "notified";
+    !reviewReady ||
+    (reviewHandoffDisabled &&
+      reviewHandoffState !== "notified" &&
+      reviewHandoffState !== "recorded");
   const trimmedOverallComment = overallComment.trim();
 
   return (
@@ -758,7 +816,10 @@ export function DocumentWorkspace({
                   disabled={reviewHandoffButtonDisabled}
                   aria-disabled={reviewHandoffButtonDisabled || undefined}
                   onClick={() => {
-                    if (reviewHandoffState === "notified") {
+                    if (
+                      reviewHandoffState === "notified" ||
+                      reviewHandoffState === "recorded"
+                    ) {
                       setReviewHandoffPopoverOpen(true);
                       return;
                     }
@@ -933,7 +994,7 @@ export function DocumentWorkspace({
                 {conflictNotice.title}
               </div>
               <div className="mt-0.5 text-xs leading-5 text-amber-900 dark:text-amber-200">
-                {conflictNotice.body}
+                {documentProblem ?? conflictNotice.body}
               </div>
             </div>
           </div>
@@ -965,6 +1026,7 @@ export function DocumentWorkspace({
             <Button
               type="button"
               data-testid="file-conflict-action-overwrite"
+              disabled={documentDiskChangeState === "unavailable"}
               variant="ghost"
               size="sm"
               className="h-8 rounded-[7px] bg-amber-900 dark:bg-amber-600 px-2 text-xs text-white hover:bg-amber-800 dark:hover:bg-amber-500"

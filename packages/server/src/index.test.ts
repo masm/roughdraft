@@ -562,6 +562,7 @@ describe("createApp", () => {
       capabilities: {
         durableReviewEvents: 1,
         reviewContext: 1,
+        reviewOpenLoad: 1,
         projectPathRequired: true,
         fileSystemBrowsing: true,
         remoteDocuments: true,

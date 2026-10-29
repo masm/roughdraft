@@ -1,12 +1,12 @@
 {
   "name": "roughdraft",
-  "version": "0.1.10",
+  "version": "0.1.11-masm.1",
   "description": "A local markdown review app",
   "license": "MIT",
   "author": "Nathan Baschez",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Lex-Inc/roughdraft.git"
+    "url": "git+https://github.com/masm/roughdraft.git"
   },
   "bin": {
     "roughdraft": "./packages/server/bin/roughdraft.mjs"

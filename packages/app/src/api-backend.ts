@@ -1,3 +1,9 @@
+import { joinPath } from "./app-navigation";
+import {
+  parseReviewContext,
+  sameRequestedReview,
+  type ReviewBinding,
+} from "./review-context";
 import {
   type BackendInfo,
   type CompleteReviewOptions,
@@ -59,6 +65,7 @@ export class ApiBackend implements StorageBackend {
     relativePath: string,
     content: string,
     expectedVersion?: string,
+    reviewBinding?: ReviewBinding,
   ): Promise<Page> {
     const res = await fetch(
       this.buildUrl("/api/markdown-file", { path: relativePath }),
@@ -69,6 +76,12 @@ export class ApiBackend implements StorageBackend {
           content,
           expectedVersion,
           projectPath: this.info.projectPath,
+          ...(reviewBinding
+            ? {
+                journalId: reviewBinding.journalId,
+                reviewContext: reviewBinding.reviewContext,
+              }
+            : {}),
         }),
       },
     );
@@ -94,6 +107,9 @@ export class ApiBackend implements StorageBackend {
       this.buildUrl("/api/markdown-file/events", { path: relativePath }),
     );
 
+    source.addEventListener("open", () => {
+      onChange({ path: relativePath, exists: true, version: null });
+    });
     source.addEventListener("change", (event) => {
       try {
         onChange(JSON.parse((event as MessageEvent<string>).data));
@@ -125,6 +141,15 @@ export class ApiBackend implements StorageBackend {
           projectPath: this.info.projectPath,
           path: relativePath,
           ...(overallComment ? { overallComment } : {}),
+          ...(options.expectedVersion !== undefined
+            ? { expectedVersion: options.expectedVersion }
+            : {}),
+          ...(options.reviewBinding
+            ? {
+                journalId: options.reviewBinding.journalId,
+                reviewContext: options.reviewBinding.reviewContext,
+              }
+            : {}),
         }),
       },
     );
@@ -135,8 +160,150 @@ export class ApiBackend implements StorageBackend {
       );
     }
 
-    const payload = (await res.json()) as { delivered?: unknown };
-    return { delivered: payload.delivered === true };
+    const payload = (await res.json()) as {
+      delivered?: unknown;
+      event?: { type?: string; eventId?: string };
+    };
+    return {
+      delivered: payload.delivered === true,
+      ...(payload.event?.type === "review.completed" &&
+      typeof payload.event.eventId === "string"
+        ? { recorded: true }
+        : {}),
+    };
+  }
+
+  async getReviewReceipt(
+    _relativePath: string,
+    binding: ReviewBinding,
+  ): Promise<CompleteReviewResult | null> {
+    const response = await fetch("/api/review-events/watch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        journalId: binding.journalId,
+        reviewId: binding.reviewContext.reviewId,
+        afterSequence: 0,
+        fromNow: false,
+        timeoutSeconds: 0,
+        batchWindowSeconds: 0,
+      }),
+    });
+    if (!response.ok)
+      throw new Error(
+        `The review receipt could not be recovered: ${response.status}`,
+      );
+    const payload = await response.json();
+    if (!Array.isArray(payload.events))
+      throw new Error("The review receipt response is invalid.");
+    if (payload.events.length === 0) return null;
+    const event = payload.events[0];
+    if (
+      payload.events.length !== 1 ||
+      event.type !== "review.completed" ||
+      typeof event.eventId !== "string" ||
+      event.journalId !== binding.journalId ||
+      event.reviewId !== binding.reviewContext.reviewId ||
+      !sameRequestedReview(binding, {
+        journalId: event.journalId,
+        reviewContext: parseReviewContext(event.reviewContext),
+      })
+    )
+      throw new Error("The recovered receipt belongs to another review.");
+    return { recorded: true, delivered: false };
+  }
+
+  async getReviewContext(
+    relativePath: string,
+    journalId?: string,
+  ): Promise<ReviewBinding | null> {
+    if (!journalId) {
+      const status = await fetch("/api/status");
+      if (!status.ok)
+        throw new Error(`Review state is unavailable: ${status.status}`);
+      const payload = await status.json();
+      journalId = payload.reviewEvents?.journalId;
+      if (typeof journalId !== "string")
+        throw new Error(
+          "This server does not support durable review contexts.",
+        );
+    }
+    const path = /^(?:\/|[A-Za-z]:[\\/])/.test(relativePath)
+      ? relativePath
+      : joinPath(this.info.projectPath ?? "", relativePath);
+    const response = await fetch(
+      this.buildUrl("/api/open-request", { path, journalId }),
+    );
+    if (!response.ok)
+      throw new Error(
+        `Could not validate the opening context: ${response.status}`,
+      );
+    const payload = await response.json();
+    const context = payload.context;
+    if (!context || context.status === "retired") return null;
+    if (
+      (context.status !== "opening" &&
+        context.status !== "loaded" &&
+        context.status !== "completed") ||
+      typeof context.documentPath !== "string"
+    )
+      throw new Error("The accepted review context is invalid.");
+    return {
+      journalId,
+      reviewContext: parseReviewContext(context),
+      documentPath: context.documentPath,
+      status: context.status,
+    };
+  }
+
+  async acknowledgeReviewContext(
+    relativePath: string,
+    version: string,
+    binding?: ReviewBinding | null,
+    loadRequestId?: string,
+  ): Promise<void> {
+    if (!binding && !loadRequestId) return;
+    const response = await fetch("/api/open-request/ack", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path:
+          binding?.documentPath ??
+          joinPath(this.info.projectPath ?? "", relativePath),
+        version,
+        ...(binding
+          ? {
+              journalId: binding.journalId,
+              reviewContext: binding.reviewContext,
+            }
+          : {}),
+        ...(loadRequestId ? { loadRequestId } : {}),
+      }),
+    });
+    if (!response.ok)
+      throw new Error(
+        `The document load could not be acknowledged: ${response.status}`,
+      );
+  }
+
+  async reportOpenFailure(
+    relativePath: string,
+    loadRequestId: string,
+    error: string,
+  ): Promise<void> {
+    const response = await fetch("/api/open-request/failure", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        path: joinPath(this.info.projectPath ?? "", relativePath),
+        loadRequestId,
+        error,
+      }),
+    });
+    if (!response.ok)
+      throw new Error(
+        `The opening failure could not be reported: ${response.status}`,
+      );
   }
 
   async getReviewWatchStatus(relativePath: string): Promise<ReviewWatchStatus> {

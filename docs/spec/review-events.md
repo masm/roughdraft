@@ -77,3 +77,36 @@ Receipt versions derive from the bytes and stats of one verified open-file snaps
 Scoped watches default to a 240-second hold; explicit holds clamp to 300 seconds. Legacy path-based watches remain available and keep their indefinite default. `fromNow` defaults to true for compatibility; callers recovering a round must explicitly send false. Responses contain events strictly after the cursor, `timedOut`, and the journal snapshot. Timeout means pending, not cancellation. HTTP disconnect immediately removes that waiter and its timers; it does not retire the review or erase receipts.
 
 Context/protocol failures return JSON `{ code, error }`: `invalid_request` (400), `stale_context`, `context_retired`, `save_conflict` or caller-binding `recovery_unavailable` (409), and storage `recovery_unavailable`, `writer_busy`, or `receipt_unavailable` (503). Existing local-file validation and save-conflict response shapes remain supported.
+
+## Browser loading and saved feedback
+
+The browser validates the accepted scoped tuple before fetching a file and again after its asynchronous load. It acknowledges the canonical path and actual version before enabling scoped saves or Done. Newer typing, selected documents and opening operations fence older responses. Each save must return the persisted Page; a nullish response is not success. Done flushes pending editor work and completes against the version that save confirmed. A provided version is checked for ordinary completion too; old callers that omit it keep their legacy contract.
+
+A clean document revalidates on file-event connection/reconnection and same-path reopening. Connected change detection also observes ctime, so equal-size edits with restored mtime are detected. Dirty drafts survive external changes: autosave and Done pause until reload or explicit overwrite; keeping editing leaves autosave paused. Missing/unreadable files retain the visible draft and block completion. Restoring readability can revalidate the document. A completed scoped receipt remains Saved after page reload; it does not become a fresh review.
+
+Scoped completion response loss keeps an in-memory pending request. A retry first checks its UUID receipt, or repeats the same confirmed-version completion without another save. Changed draft/comment input requires reconciliation instead of silently discarding new feedback. The durable receipt, not transport watcher presence, establishes completion; a disconnected agent can recover it later.
+
+Each CLI opening also registers a transient `loadRequestId`. The server puts `openRequest=<id>` in the browser URL, accepts a matching version/path acknowledgment, and exposes it through `GET /api/open-request/load?id=…`. A browser can POST `/api/open-request/failure` with the ID, path and a short error. SSE delivery or native launcher exit alone is insufficient. These small load-operation records are memory-only, bounded to256, and eligible for cleanup after15 minutes when a new request is registered; they are not review metadata. After restart or cleanup, a browser may still validate its durable scoped context (or an ordinary unowned file) without recreating the lost operation. A CLI querying that lost load ID still gets an explicit recovery error and must retry opening.
+
+## CLI adapter
+
+Ordinary `roughdraft open <file>` verifies loading, then waits intentionally for Done Reviewing. `--no-watch` returns after verified loading instead of waiting for Done. `--open-timeout <seconds>` bounds the load step (default30, positive and at most300); opening or load failures exit1. `--no-open` and `--print-url` do not claim that a window launched or loaded. An API-less preview-web route cannot verify a local file opening. Remote-document mode keeps its separate existing transport and does not accept local scoped flags.
+
+A local integration supplies both flags together:
+
+```bash
+roughdraft open /absolute/draft.md --no-watch --json \
+  --journal-id JOURNAL_UUID \
+  --review-context '{"storeId":"STORE_UUID","generation":1,"reviewId":"REVIEW_UUID","operationId":"OPEN_UUID"}'
+```
+
+The JSON result includes `opened`, `loaded`, `url`, `serverUrl`, input `path`, `openMode`, `loadRequestId`, `journalId`, pre-exposure `afterSequence`, and the explicit `reviewId` when scoped. A successful loaded result also identifies the canonical document and loaded version. An already completed scoped retry reports `completed:true` without opening another window; recover its existing UUID receipt rather than requiring another Done.
+
+Recover without requiring the Markdown to remain on disk:
+
+```bash
+roughdraft watch --review-id REVIEW_UUID --journal-id JOURNAL_UUID \
+  --after-sequence 0 --timeout 240 --json
+```
+
+A saved cursor requires its journal binding. UUID recovery uses `fromNow:false`; ordinary open captures the current journal sequence before exposing the window, so a fast Done cannot fall into the old open-before-watch gap. Explicit replay starts at zero. Watch timeout exits1 with `timedOut:true`, meaning pending, never cancellation. Without an explicit limit, UUID watch holds240 seconds and ordinary legacy path watch remains indefinite. Successful JSON goes only to stdout; errors are diagnostics on stderr. Server start, stop and status continue to use their existing lifecycle state/port flags.

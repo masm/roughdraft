@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.1.11-masm.1 — 2026-10-29
+
+- Verify browser loading before waiting, carry explicit review identity through saves/Done, recover scoped response-loss retries, and refresh clean documents after reconnect or same-path reopen while preserving conflicting drafts.
 
 - Protect existing feedback from partial overall-comment writes with checked atomic replacement, and wake existing review watchers when an interrupted receipt is recovered.
 
