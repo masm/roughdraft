@@ -104,13 +104,10 @@ export class LocalStorageBackend implements StorageBackend {
     writePages(pages);
   }
 
-  async saveMarkdownFile(
-    relativePath: string,
-    content: string,
-  ): Promise<undefined> {
+  async saveMarkdownFile(relativePath: string, content: string): Promise<Page> {
     const id = relativePath.replace(/\.md$/i, "");
     await this.savePage(id, content);
-    return undefined;
+    return this.getPage(id);
   }
 
   async completeReview(

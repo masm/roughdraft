@@ -1135,7 +1135,7 @@ function parseRoughdraftEndmatter(markdown: string): RoughdraftEndmatter {
   if (!hasRoughdraftKeys) return empty;
   if (
     !markdown.slice(0, match.offset).includes("{#") &&
-    !hasDocumentLevelComment(parsed)
+    !hasEndmatterFeedback(parsed)
   ) {
     return empty;
   }
@@ -1150,14 +1150,13 @@ function parseRoughdraftEndmatter(markdown: string): RoughdraftEndmatter {
   };
 }
 
-function hasDocumentLevelComment(parsed: Record<string, unknown>): boolean {
+function hasEndmatterFeedback(parsed: Record<string, unknown>): boolean {
   const comments = readEndmatterEntries(parsed.comments);
   for (const entry of comments.values()) {
     if (
       typeof entry.body === "string" &&
       typeof entry.by === "string" &&
-      typeof entry.at === "string" &&
-      !entry.re
+      typeof entry.at === "string"
     ) {
       return true;
     }

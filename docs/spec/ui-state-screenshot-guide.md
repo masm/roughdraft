@@ -135,12 +135,12 @@ suggestions:
 | Editor | Selection menu on suggestion | Select existing suggestion text | `selection-menu-action-accept-suggestion`, `selection-menu-action-reject-suggestion` | Requires review fixture. |
 | Editor | Link popover | Click a link or choose Link from selection menu | `link-popover`, `link-url-input`, `link-action-open`, `link-action-delete` | Use the plain fixture link. |
 | Editor | Context menu | Right-click in rich editor | `editor-context-menu` | Capture comment, suggestion, paste, and paste-markdown actions. |
-| Review rail | Comments | Open review fixture in rich mode | `document-review-rail`, `comment-thread-root` | Thread containers use `data-comment-thread-container="true"`. |
+| Review rail | Comments | Open review fixture in rich mode | `document-review-rail`, `comment-thread-root` | Thread containers use `data-comment-thread-container="true"`. Expand a root and confirm YAML-only replies and nested replies remain visible after reload. Save a two-paragraph comment, reload, and confirm its review card appears without raw CriticMarkup in the document. |
 | Review rail | Suggestions | Open review fixture in rich mode | `suggestion-thread-s1`, `suggestion-thread-s2`, `suggestion-thread-s3` | Thread containers use `data-suggestion-thread-container="true"`. |
 | Review rail | Draft suggestion | Select text and choose a suggestion action | `draft-suggestion-thread`, `draft-suggestion-editor` | Capture dismiss/cancel/apply actions. |
 | Comment editor | New root comment draft | Select text and choose Add comment | `comment-rail-c1-editor`, `comment-rail-c1-action-save` | Save uses the popover-style button; footer Cancel is absent because the thread trash action dismisses the draft. |
 | Comment editor | Root comment editing | Use a comment card edit action | `comment-rail-root-editor` | Comment test IDs follow `comment-${variant}-${id}-...`. |
-| Comment editor | Reply editing | Use a reply action | `comment-rail-child-editor` | Useful for nested thread spacing. |
+| Comment editor | Reply editing | Use a reply action | `comment-rail-child-editor` | Reply to a loaded YAML-backed reply, save, reload, and reply again to confirm nested editors and thread spacing. |
 | Code mode | Review rail present | Open review fixture with `?editor=code` | `page-card-code`, `markdown-code-editor` | Confirms code editor and rail can coexist. |
 | Code mode | Review rail absent | Open fenced fixture with `?editor=code` | `page-card-code`, `markdown-code-editor` | Confirms fenced CriticMarkup alone does not create review rail. |
 | Error/home fallback | Non-Markdown path | Open URL with `?path=/tmp/file.txt` | homepage error message | Copy: `Roughdraft now opens one .md file at a time.` |
@@ -194,3 +194,9 @@ The most reliable long-term solution is a dedicated screenshot harness route or 
 - Capture both rich-text and code editor for document states that affect the editor surface or review rail.
   
 - Keep screenshots in `.context/` unless the run is intentionally being committed as visual documentation.
+
+## Durable review handoff states
+
+Capture scoped review loading (Done disabled until file/context acknowledgment), an ordinary approved/no-change round, a completed receipt with its agent disconnected (Saved and recoverable), and a fresh second round on the same path (Approve again). Include a lost-response retry that recovers the existing receipt without another comment.
+
+Capture an unavailable/missing file with the draft still visible and autosave/Done paused; restoration or Reload should recover the view. Keep the existing dirty-conflict, reload, explicit overwrite and keep-editing captures. A stale opening/context error preserves the current draft and explains that the current review must be reopened. Store new runs under the existing `.context/ui-state-screenshots/` convention.

@@ -316,6 +316,27 @@ describe("extractRoughdraftReviewIndex", () => {
     });
   });
 
+  it("extracts YAML replies whose parent uses legacy inline metadata", () => {
+    const input = [
+      'Review {==this==}{>>Needs detail<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}.',
+      "",
+      "---",
+      "comments:",
+      "  c2:",
+      "    body: I added context.",
+      "    by: AI",
+      '    at: "2026-04-28T12:01:00.000Z"',
+      "    re: c1",
+      "",
+    ].join("\n");
+    const index = extractRoughdraftReviewIndex(input);
+    expect(index.items.find((item) => item.id === "c2")).toMatchObject({
+      kind: "reply",
+      parentId: "c1",
+      text: "I added context.",
+    });
+  });
+
   it("extracts equivalent review items from YAML endmatter metadata", () => {
     const index = extractRoughdraftReviewIndex(
       [

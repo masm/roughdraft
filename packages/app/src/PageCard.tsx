@@ -581,6 +581,32 @@ function addCommentIdsToCriticChange(
   return true;
 }
 
+// Endmatter-only replies have no mark of their own. Locate their thread's
+// nearest anchored ancestor while retaining the clicked reply as the parent.
+function addReplyIdToThreadAnchor(
+  editor: Editor,
+  parentCommentId: string,
+  replyId: string,
+  comments: ReadonlyMap<string, CriticComment>,
+): boolean {
+  const visited = new Set<string>();
+  let currentId: string | null = parentCommentId;
+
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId);
+    if (addCommentIdsToAnchor(editor, currentId, [replyId])) return true;
+
+    const comment = comments.get(currentId);
+    if (!comment) {
+      // A comment's parent can be a suggestion rather than another comment.
+      return addCommentIdsToCriticChange(editor, currentId, [replyId]);
+    }
+    currentId = comment.parentCommentId ?? null;
+  }
+
+  return false;
+}
+
 export function shouldDismissCommentThread(target: EventTarget | null) {
   if (!(target instanceof Element)) return true;
 
@@ -1650,15 +1676,16 @@ const RichTextEditorSurface = memo(function RichTextEditorSurface({
         },
       );
       suppressNextMarkdownUpdateRef.current = true;
-      const nextAnchorCommentIds = addCommentIdsToAnchor(
+      const didAddCommentId = addReplyIdToThreadAnchor(
         currentEditor,
         commentId,
-        [comment.id],
+        comment.id,
+        commentsRef.current,
       );
       if (suppressNextMarkdownUpdateRef.current) {
         suppressNextMarkdownUpdateRef.current = false;
       }
-      if (!nextAnchorCommentIds) return;
+      if (!didAddCommentId) return;
 
       const nextComments = new Map(commentsRef.current);
       nextComments.set(comment.id, comment);

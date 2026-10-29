@@ -16,6 +16,7 @@ import {
   ROUGHDRAFT_PUBLIC_HOST,
 } from "./network.js";
 import { findAvailablePort } from "./ports.js";
+import { parseReviewContext, type ReviewContext } from "./review-store.js";
 import { resolveUpdateStatus, type UpdateStatus } from "./update-status.js";
 
 const AGENT_SETUP_URL = "https://roughdraft.md/setup.md";
@@ -87,7 +88,7 @@ export interface CliDependencies {
   }) => Promise<SpawnedServer> | SpawnedServer;
   isProcessRunning: (pid: number) => boolean;
   stopProcess: (pid: number) => Promise<void>;
-  openUrl: (url: string) => OpenMode;
+  openUrl: (url: string) => OpenMode | Promise<OpenMode>;
   resolveUpdateStatus: () => Promise<UpdateStatus>;
   log: (message: string) => void;
   error: (message: string) => void;
@@ -149,6 +150,9 @@ interface ParsedCommandOptions {
   noWatch: boolean;
   printUrl: boolean;
   port?: string;
+  journalId?: string;
+  reviewContext?: ReviewContext;
+  openTimeoutSeconds?: number;
   replay: boolean;
   stateDir?: string;
   stateFile?: string;
@@ -158,6 +162,9 @@ interface ParsedCommandOptions {
 }
 
 interface ParsedWatchOptions {
+  reviewId?: string;
+  journalId?: string;
+  afterSequence?: number;
   batchWindowSeconds: number;
   help: boolean;
   json: boolean;
@@ -296,6 +303,30 @@ function parseCommandOptions(
 
     if (arg === "--json") {
       parsed.json = true;
+      continue;
+    }
+
+    const newFlag = arg.split("=", 1)[0];
+    if (
+      ["--review-context", "--journal-id", "--open-timeout"].includes(newFlag)
+    ) {
+      if (!options.allowOpen) throw new Error(`Unknown flag: ${newFlag}`);
+      const next = arg.includes("=")
+        ? { value: arg.slice(arg.indexOf("=") + 1), nextIndex: index }
+        : takeFlagValue(args, index, arg);
+      index = next.nextIndex;
+      if (newFlag === "--review-context")
+        parsed.reviewContext = parseReviewContext(JSON.parse(next.value));
+      else if (newFlag === "--journal-id")
+        parsed.journalId = reviewIdentifier(next.value, newFlag);
+      else {
+        const seconds = Number(next.value);
+        if (!Number.isFinite(seconds) || seconds <= 0 || seconds > 300)
+          throw new Error(
+            "--open-timeout must be greater than zero and at most 300 seconds.",
+          );
+        parsed.openTimeoutSeconds = seconds;
+      }
       continue;
     }
 
@@ -462,6 +493,27 @@ function parseWatchOptions(args: string[]): ParsedWatchOptions {
       continue;
     }
 
+    const newFlag = arg.split("=", 1)[0];
+    if (["--review-id", "--journal-id", "--after-sequence"].includes(newFlag)) {
+      const next = arg.includes("=")
+        ? { value: arg.slice(arg.indexOf("=") + 1), nextIndex: index }
+        : takeFlagValue(args, index, arg);
+      index = next.nextIndex;
+      if (newFlag === "--review-id")
+        parsed.reviewId = reviewIdentifier(next.value, newFlag);
+      else if (newFlag === "--journal-id")
+        parsed.journalId = reviewIdentifier(next.value, newFlag);
+      else {
+        const sequence = Number(next.value);
+        if (!Number.isSafeInteger(sequence) || sequence < 0)
+          throw new Error(
+            "--after-sequence must be a nonnegative safe integer.",
+          );
+        parsed.afterSequence = sequence;
+      }
+      continue;
+    }
+
     if (arg === "--replay") {
       parsed.replay = true;
       continue;
@@ -529,6 +581,12 @@ function parseWatchOptions(args: string[]): ParsedWatchOptions {
   }
 
   return parsed;
+}
+
+function reviewIdentifier(value: string, flag: string): string {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,255}$/.test(value))
+    throw new Error(`${flag} needs a nonempty review identifier.`);
+  return value;
 }
 
 function parsePositiveNumber(value: string, flag: string): number {
@@ -600,7 +658,10 @@ function suggestCommand(command: string): string | null {
 }
 
 type SpawnSyncCommand = typeof spawnSync;
-type OpenDetachedCommand = typeof openDetached;
+type OpenDetachedCommand = (
+  command: string,
+  args: string[],
+) => void | Promise<void>;
 
 function hasChromeAppMode(
   platform: NodeJS.Platform = process.platform,
@@ -614,13 +675,21 @@ function hasChromeAppMode(
   );
 }
 
-function openDetached(command: string, args: string[]) {
-  const child = spawn(command, args, {
-    detached: true,
-    stdio: "ignore",
-    windowsHide: true,
+function openDetached(command: string, args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    child.once("error", reject);
+    child.once("exit", (code, signal) =>
+      code === 0
+        ? resolve()
+        : reject(new Error(`Browser opener failed (${signal ?? code}).`)),
+    );
+    child.unref();
   });
-  child.unref();
 }
 
 function resolveDefaultBrowserBundleId(
@@ -680,7 +749,7 @@ export function createDefaultOpenUrl({
   platform?: NodeJS.Platform;
   spawnSyncCommand?: SpawnSyncCommand;
   openDetachedCommand?: OpenDetachedCommand;
-} = {}): (url: string) => OpenMode {
+} = {}): (url: string) => OpenMode | Promise<OpenMode> {
   return (url: string) => {
     if (env.ROUGHDRAFT_NO_OPEN === "1") {
       return "disabled";
@@ -692,36 +761,44 @@ export function createDefaultOpenUrl({
       )
     ) {
       if (hasChromeAppMode(platform, spawnSyncCommand)) {
-        openDetachedCommand("open", [
+        const attempt = openDetachedCommand("open", [
           "-na",
           "Google Chrome",
           "--args",
           `--app=${url}`,
         ]);
-        return "chrome-app";
+        return attempt instanceof Promise
+          ? attempt.then(() => "chrome-app" as const)
+          : "chrome-app";
       }
     }
 
     if (platform === "darwin") {
-      openDetachedCommand("open", [url]);
-      return "browser";
+      const attempt = openDetachedCommand("open", [url]);
+      return attempt instanceof Promise
+        ? attempt.then(() => "browser" as const)
+        : "browser";
     }
 
     if (platform === "linux") {
-      openDetachedCommand("xdg-open", [url]);
-      return "browser";
+      const attempt = openDetachedCommand("xdg-open", [url]);
+      return attempt instanceof Promise
+        ? attempt.then(() => "browser" as const)
+        : "browser";
     }
 
     if (platform === "win32") {
-      openDetachedCommand("cmd", ["/c", "start", "", url]);
-      return "browser";
+      const attempt = openDetachedCommand("cmd", ["/c", "start", "", url]);
+      return attempt instanceof Promise
+        ? attempt.then(() => "browser" as const)
+        : "browser";
     }
 
     return "none";
   };
 }
 
-function defaultOpenUrl(url: string): OpenMode {
+function defaultOpenUrl(url: string): OpenMode | Promise<OpenMode> {
   return createDefaultOpenUrl()(url);
 }
 
@@ -897,7 +974,16 @@ function printCommandHelp(
     log(
       "  --print-url          Print only the document URL and do not open it",
     );
-    log("  --no-watch           Open the file without waiting");
+    log(
+      "  --no-watch           Return after verified load, without waiting for Done",
+    );
+    log("  --open-timeout <s>    Load deadline, default 30; maximum 300");
+    log(
+      "  --review-context <json>  Explicit integration context (with --journal-id)",
+    );
+    log(
+      "  --journal-id <id>     Required durable journal binding for scoped opens",
+    );
     log("  --timeout <seconds>  Maximum watch time; omitted means no timeout");
     log("  --replay             Allow watch to return retained older events");
     log("  --json               Print machine-readable output");
@@ -979,6 +1065,15 @@ function printCommandHelp(
     );
     log("");
     log("Flags:");
+    log(
+      "  --review-id <id>          Recover a specific review without its file",
+    );
+    log(
+      "  --journal-id <id>         Bind recovery/cursor to its durable journal",
+    );
+    log(
+      "  --after-sequence <n>      Last consumed sequence (nonnegative integer)",
+    );
     log("  --json                    Print machine-readable output");
     log(
       "  --timeout <seconds>       Maximum wait time; omitted means no timeout",
@@ -1396,30 +1491,74 @@ async function runRemoteOpen(
   return 0;
 }
 
-async function sendOpenRequestToExistingWindow(
+interface OpeningResult {
+  delivered: boolean;
+  url: string;
+  load?: {
+    id: string;
+    status: "opening" | "loaded" | "failed";
+    documentPath: string;
+    version?: string;
+    error?: string;
+  };
+  context?: { status: string };
+}
+async function apiJson(deps: CliDependencies, url: URL, body?: unknown) {
+  const response = await deps.fetchImpl(url, {
+    ...(body === undefined
+      ? {}
+      : {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+    signal: AbortSignal.timeout(5_000),
+  });
+  const payload = await response.json();
+  if (!response.ok)
+    throw new Error(
+      payload.error ?? `Roughdraft request failed: ${response.status}`,
+    );
+  return payload;
+}
+async function waitForLoaded(
   deps: CliDependencies,
-  baseUrl: string,
-  targetUrl: string,
-  openPath: string,
-): Promise<boolean> {
-  try {
-    const requestUrl = new URL("/api/open-request", baseUrl);
-    const response = await deps.fetchImpl(requestUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: openPath, url: targetUrl }),
-      signal: AbortSignal.timeout(STATUS_TIMEOUT_MS),
-    });
-
-    if (!response.ok) {
-      return false;
+  apiUrl: string,
+  id: string,
+  timeoutSeconds: number,
+  signal: AbortSignal,
+): Promise<NonNullable<OpeningResult["load"]>> {
+  const deadline = Date.now() + timeoutSeconds * 1000;
+  while (!signal.aborted) {
+    const url = new URL("/api/open-request/load", apiUrl);
+    url.searchParams.set("id", id);
+    let response: Response;
+    try {
+      response = await deps.fetchImpl(url, {
+        signal: AbortSignal.any([
+          signal,
+          AbortSignal.timeout(
+            Math.max(1, Math.min(5_000, deadline - Date.now())),
+          ),
+        ]),
+      });
+    } catch (error) {
+      throw new Error(
+        `Document load acknowledgment failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
-
-    const payload = (await response.json()) as { delivered?: unknown };
-    return payload.delivered === true;
-  } catch {
-    return false;
+    const payload = await response.json();
+    if (!response.ok)
+      throw new Error(
+        payload.error ?? "The document load could not be verified.",
+      );
+    if (payload.load?.status === "loaded") return payload.load;
+    if (payload.load?.status === "failed")
+      throw new Error(payload.load.error ?? "The document failed to load.");
+    if (Date.now() >= deadline) break;
+    await deps.sleepImpl(Math.min(100, Math.max(1, deadline - Date.now())));
   }
+  throw new Error("Document load acknowledgment timed out.");
 }
 
 function resolveTargetPath(inputPath: string): ResolvedTargetPath {
@@ -2108,30 +2247,35 @@ async function runWatch(
   options: ParsedWatchOptions,
   json: boolean,
 ): Promise<number> {
-  const target = resolveTargetPath(targetPath);
+  const target = options.reviewId ? null : resolveTargetPath(targetPath);
   let serverUrl = options.serverUrl;
   if (!serverUrl) {
     const result = await ensureServerRunning(deps, {
-      projectDir: target.projectDir,
+      projectDir: target?.projectDir ?? deps.cwd,
     });
     serverUrl = result.server.url;
   }
-  const relativePath = path.relative(target.projectDir, target.openPath);
-  const body: {
-    projectPath: string;
-    path: string;
-    timeoutSeconds?: number;
-    batchWindowSeconds: number;
-    fromNow: boolean;
-  } = {
-    projectPath: target.projectDir,
-    path: relativePath,
+  const timeout =
+    options.timeoutSeconds ?? (options.reviewId ? 240 : undefined);
+  const body = {
+    ...(target
+      ? {
+          projectPath: target.projectDir,
+          path: path.relative(target.projectDir, target.openPath),
+        }
+      : {}),
+    ...(options.journalId ? { journalId: options.journalId } : {}),
+    ...(options.reviewId ? { reviewId: options.reviewId } : {}),
+    ...(options.afterSequence !== undefined
+      ? { afterSequence: options.afterSequence }
+      : {}),
     batchWindowSeconds: options.batchWindowSeconds,
-    fromNow: !options.replay,
+    fromNow:
+      options.afterSequence === undefined &&
+      !options.replay &&
+      !options.reviewId,
+    ...(timeout !== undefined ? { timeoutSeconds: timeout } : {}),
   };
-  if (options.timeoutSeconds !== undefined) {
-    body.timeoutSeconds = options.timeoutSeconds;
-  }
 
   const response = await deps.fetchImpl(
     new URL("/api/review-events/watch", serverUrl),
@@ -2139,8 +2283,8 @@ async function runWatch(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-      ...(options.timeoutSeconds !== undefined
-        ? { signal: AbortSignal.timeout((options.timeoutSeconds + 5) * 1000) }
+      ...(timeout !== undefined
+        ? { signal: AbortSignal.timeout((timeout + 5) * 1000) }
         : {}),
     },
   );
@@ -2161,11 +2305,13 @@ async function runWatch(
   }
 
   if (payload.timedOut) {
-    deps.log(`No review completed event received for ${target.openPath}.`);
+    deps.log(
+      `No review completed event received for ${target?.openPath ?? options.reviewId}.`,
+    );
     return 1;
   }
 
-  deps.log(`Review completed for ${target.openPath}.`);
+  deps.log(`Review completed for ${target?.openPath ?? options.reviewId}.`);
   deps.log(`Received ${(payload.events ?? []).length} event(s).`);
   return 0;
 }
@@ -2595,15 +2741,22 @@ export async function runCli(
         return 0;
       }
 
-      if (options.positionals.length !== 1) {
-        deps.error("Usage: roughdraft watch <path> [--json]");
+      if (
+        options.positionals.length > 1 ||
+        (!options.reviewId && options.positionals.length !== 1) ||
+        ((options.reviewId || options.afterSequence !== undefined) &&
+          !options.journalId)
+      ) {
+        deps.error(
+          "Usage: roughdraft watch <path> or --review-id <id> --journal-id <id> [--json]",
+        );
         return USAGE_ERROR;
       }
 
       deps = applyWatchEnvOverrides(deps, options);
       const json = parsed.global.json || options.json;
       shouldPrintUpdateNotice = !json;
-      return runWatch(deps, options.positionals[0] ?? "", options, json);
+      return await runWatch(deps, options.positionals[0] ?? "", options, json);
     }
 
     if (command === "mcp") {
@@ -2696,6 +2849,10 @@ export async function runCli(
         return USAGE_ERROR;
       }
 
+      if (Boolean(options.reviewContext) !== Boolean(options.journalId)) {
+        deps.error("Use --review-context and --journal-id together.");
+        return USAGE_ERROR;
+      }
       deps = applyCliEnvOverrides(deps, options);
       const json = parsed.global.json || options.json;
       let resolvedTarget: ResolvedTargetPath;
@@ -2713,7 +2870,13 @@ export async function runCli(
           ? deps.env.ROUGHDRAFT_HOST.trim()
           : "";
       if (remoteHost.length > 0) {
-        return runRemoteOpen(deps, {
+        if (options.reviewContext) {
+          deps.error(
+            "Scoped review handoffs require a local Roughdraft server.",
+          );
+          return USAGE_ERROR;
+        }
+        return await runRemoteOpen(deps, {
           host: remoteHost,
           openPath,
           noOpen: options.noOpen,
@@ -2733,19 +2896,87 @@ export async function runCli(
         baseUrl = buildPublicBaseUrl(result.server.port);
       }
 
-      const targetUrl = buildTargetUrl(baseUrl, openPath);
+      if (options.printUrl && !options.reviewContext) {
+        deps.log(buildTargetUrl(baseUrl, openPath));
+        return 0;
+      }
+      const apiUrl = liveDevFrontend?.apiUrl ?? result?.server.url ?? baseUrl;
+      const status = await apiJson(deps, new URL(STATUS_PATH, apiUrl));
+      const journalId = status.reviewEvents?.journalId;
+      const beforeSequence = status.reviewEvents?.latestSequence;
+      if (
+        typeof journalId !== "string" ||
+        !Number.isSafeInteger(beforeSequence) ||
+        status.capabilities?.reviewOpenLoad !== 1
+      )
+        throw new Error(
+          "This server does not support verified review opening.",
+        );
+      if (options.journalId && options.journalId !== journalId)
+        throw new Error(
+          "The review journal has changed; recovery is unavailable.",
+        );
+      const mayOpen = !options.noOpen && deps.env.ROUGHDRAFT_NO_OPEN !== "1";
+      const loadRequestId = crypto.randomUUID();
+      const opening = (await apiJson(
+        deps,
+        new URL("/api/open-request", apiUrl),
+        {
+          path: openPath,
+          url: buildTargetUrl(baseUrl, openPath),
+          loadRequestId,
+          notify: mayOpen,
+          ...(options.reviewContext
+            ? { journalId, reviewContext: options.reviewContext }
+            : {}),
+        },
+      )) as OpeningResult;
+      const targetUrl = opening.url;
       let openMode: OpenMode = "disabled";
-      if (!options.noOpen && deps.env.ROUGHDRAFT_NO_OPEN !== "1") {
-        openMode = (await sendOpenRequestToExistingWindow(
+      let loaded: OpeningResult["load"];
+      if (mayOpen && opening.context?.status !== "completed") {
+        const controller = new AbortController();
+        const evidence = waitForLoaded(
           deps,
-          baseUrl,
-          targetUrl,
-          openPath,
-        ))
-          ? "existing-window"
-          : deps.openUrl(targetUrl);
+          apiUrl,
+          loadRequestId,
+          options.openTimeoutSeconds ?? 30,
+          controller.signal,
+        );
+        try {
+          if (opening.delivered) {
+            openMode = "existing-window";
+            loaded = await evidence;
+          } else {
+            const launch: { mode: OpenMode } = { mode: "disabled" };
+            const attempt = Promise.resolve()
+              .then(() => deps.openUrl(targetUrl))
+              .then((mode) => {
+                launch.mode = mode;
+                return mode;
+              });
+            // A real loaded window is sufficient even if an OS launcher remains running.
+            loaded = await Promise.race([
+              evidence,
+              attempt.then((mode) => {
+                if (mode === "disabled" || mode === "none") {
+                  controller.abort();
+                  return undefined;
+                }
+                return evidence;
+              }),
+            ]);
+            openMode =
+              loaded && launch.mode === "disabled" ? "browser" : launch.mode;
+          }
+        } finally {
+          controller.abort();
+          await evidence.catch(() => undefined);
+        }
       }
 
+      if (loaded && loaded.documentPath !== fs.realpathSync(openPath))
+        throw new Error("The load acknowledgment belongs to another document.");
       if (result?.portChanged) {
         const message = `Preferred port ${getPreferredPort(deps.env)} is busy, using ${result.server.port}.`;
         if (options.printUrl) {
@@ -2782,20 +3013,39 @@ export async function runCli(
           json,
           positionals: [target],
           replay: options.replay,
-          serverUrl: liveDevFrontend?.apiUrl ?? undefined,
+          serverUrl: apiUrl,
+          journalId,
+          afterSequence:
+            options.reviewContext || options.replay ? 0 : beforeSequence,
+          ...(options.reviewContext
+            ? { reviewId: options.reviewContext.reviewId }
+            : {}),
           stateDir: options.stateDir,
           stateFile: options.stateFile,
           timeoutSeconds: options.timeoutSeconds,
         };
         shouldPrintUpdateNotice = false;
-        return runWatch(deps, target, watchOptions, json);
+        return await runWatch(deps, target, watchOptions, json);
       }
 
       if (json) {
         emitJson(deps.log, {
-          opened: true,
+          opened: loaded?.status === "loaded",
+          loaded: loaded?.status === "loaded",
+          ...(loaded
+            ? { documentPath: loaded.documentPath, version: loaded.version }
+            : {}),
+          ...(opening.context?.status === "completed"
+            ? { completed: true }
+            : {}),
+          loadRequestId,
+          journalId,
+          afterSequence: beforeSequence,
+          ...(options.reviewContext
+            ? { reviewId: options.reviewContext.reviewId }
+            : {}),
           url: targetUrl,
-          serverUrl: baseUrl,
+          serverUrl: apiUrl,
           path: openPath,
           openMode,
         });
@@ -2823,6 +3073,11 @@ export async function runCli(
     }
 
     return USAGE_ERROR;
+  } catch (error) {
+    deps.error(
+      error instanceof Error ? error.message : "Roughdraft command failed.",
+    );
+    return 1;
   } finally {
     if (shouldPrintUpdateNotice) {
       await printUpdateNoticeIfAvailable(deps);

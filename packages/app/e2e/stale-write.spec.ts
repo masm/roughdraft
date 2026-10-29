@@ -154,6 +154,8 @@ test.describe("stale writes", () => {
   test("rejects autosave after external content changes with stable metadata", async ({
     page,
   }) => {
+    await page.route("**/api/markdown-file/events**", (route) => route.abort());
+
     const fixedTimestamp = new Date("2026-01-01T00:00:00.000Z");
     const filePath = writeProjectFile(
       projectDir,
@@ -228,8 +230,9 @@ test.describe("stale writes", () => {
     ).toBeVisible();
   });
 
-  test("keeps conflict banner and save status stack from overlapping", async ({
+  test("keeps conflict banner and review status stack from overlapping", async ({
     page,
+    request,
   }) => {
     await page.route("**/api/markdown-file/events**", (route) => route.abort());
 
@@ -238,6 +241,14 @@ test.describe("stale writes", () => {
       "layout-conflict.md",
       "# Layout conflict\n\nOriginal body.\n",
     );
+
+    const pendingWatch = request.post("/api/review-events/watch", {
+      data: {
+        projectPath: projectDir,
+        path: "layout-conflict.md",
+        timeoutSeconds: 15,
+      },
+    });
 
     for (const viewport of [
       { width: 1280, height: 720 },
@@ -251,6 +262,7 @@ test.describe("stale writes", () => {
       fs.writeFileSync(filePath, "# Layout conflict\n\nExternal body.\n");
       await appendInCodeEditor(page, `\nLocal body ${viewport.width}.\n`);
 
+      await expect(page.getByTestId("review-handoff-button")).toBeVisible();
       const conflictNotice = fileConflictNotice(page);
       const statusStack = page.getByTestId("document-status-stack");
       await expect(conflictNotice).toBeVisible();
@@ -275,5 +287,6 @@ test.describe("stale writes", () => {
       await page.getByTestId("file-conflict-action-reload").click();
       await expect(conflictNotice).toBeHidden();
     }
+    await pendingWatch;
   });
 });

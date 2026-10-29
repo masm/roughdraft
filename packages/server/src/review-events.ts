@@ -19,10 +19,22 @@ export interface ReviewCompletedEvent extends ReviewCompletedEventInput {
   type: "review.completed";
   sequence: number;
   createdAt: string;
+  eventId?: string;
+  overallCommentDigest?: string;
+  journalId?: string;
+  reviewId?: string;
+  reviewContext?: {
+    storeId: string;
+    generation: number;
+    reviewId: string;
+    operationId: string;
+  };
 }
 
 export interface WaitForReviewEventsOptions {
   documentPath?: string;
+  reviewId?: string;
+  signal?: AbortSignal;
   afterSequence?: number;
   timeoutMs?: number;
   batchWindowMs?: number;
@@ -38,6 +50,8 @@ interface Waiter {
   options: NormalizedWaitOptions;
   resolve: (result: WaitForReviewEventsResult) => void;
   timeout: NodeJS.Timeout | null;
+  reject: (reason: unknown) => void;
+  stopAbort?: () => void;
   batchTimeout: NodeJS.Timeout | null;
 }
 
@@ -45,9 +59,13 @@ const DEFAULT_BATCH_WINDOW_MS = 250;
 const MAX_RETAINED_EVENTS = 100;
 
 type NormalizedWaitOptions = Required<
-  Omit<WaitForReviewEventsOptions, "documentPath" | "timeoutMs">
+  Omit<
+    WaitForReviewEventsOptions,
+    "documentPath" | "reviewId" | "signal" | "timeoutMs"
+  >
 > & {
   documentPath?: string;
+  reviewId?: string;
   timeoutMs?: number;
 };
 
@@ -55,6 +73,12 @@ export class ReviewEventQueue {
   private events: ReviewCompletedEvent[] = [];
   private waiters = new Set<Waiter>();
   private nextSequence = 1;
+
+  constructor(
+    private readonly options: {
+      history?: () => { events: ReviewCompletedEvent[]; nextSequence: number };
+    } = {},
+  ) {}
 
   emit(input: ReviewCompletedEventInput): {
     delivered: boolean;
@@ -78,6 +102,10 @@ export class ReviewEventQueue {
       overallCommentLength: event.overallComment?.length ?? 0,
     });
 
+    return { delivered: this.publish(event), event };
+  }
+
+  publish(event: ReviewCompletedEvent): boolean {
     let delivered = false;
     for (const waiter of [...this.waiters]) {
       if (matchesWaiter(event, waiter.options)) {
@@ -86,7 +114,7 @@ export class ReviewEventQueue {
       }
     }
 
-    return { delivered, event };
+    return delivered;
   }
 
   wait(
@@ -97,14 +125,19 @@ export class ReviewEventQueue {
 
     if (existing.length > 0) {
       return Promise.resolve(
-        resultForEvents(existing, false, this.nextSequence),
+        resultForEvents(existing, false, this.latestSequence() + 1),
       );
     }
 
-    return new Promise((resolve) => {
+    if (options.signal?.aborted)
+      return Promise.reject(
+        options.signal.reason ?? new Error("Review wait disconnected"),
+      );
+    return new Promise((resolve, reject) => {
       const waiter: Waiter = {
         options: normalized,
         resolve,
+        reject,
         batchTimeout: null,
         timeout:
           normalized.timeoutMs !== undefined
@@ -115,6 +148,17 @@ export class ReviewEventQueue {
       };
 
       this.waiters.add(waiter);
+      if (options.signal) {
+        const abort = () => {
+          this.removeWaiter(waiter);
+          reject(
+            options.signal?.reason ?? new Error("Review wait disconnected"),
+          );
+        };
+        options.signal.addEventListener("abort", abort, { once: true });
+        waiter.stopAbort = () =>
+          options.signal?.removeEventListener("abort", abort);
+      }
       appendSlog("review-events.wait", {
         documentPath: normalized.documentPath ?? null,
         afterSequence: normalized.afterSequence,
@@ -128,11 +172,13 @@ export class ReviewEventQueue {
   }
 
   latestSequence(): number {
-    return this.nextSequence - 1;
+    return this.options.history
+      ? this.options.history().nextSequence - 1
+      : this.nextSequence - 1;
   }
 
   waiterCountForDocument(documentPath: string): number {
-    const normalizedPath = path.resolve(documentPath);
+    const normalizedPath = canonicalDocumentPath(documentPath);
     return [...this.waiters].filter(
       (waiter) => waiter.options.documentPath === normalizedPath,
     ).length;
@@ -141,7 +187,9 @@ export class ReviewEventQueue {
   private matchingEvents(
     options: NormalizedWaitOptions,
   ): ReviewCompletedEvent[] {
-    return this.events.filter((event) => matchesWaiter(event, options));
+    return (this.options.history?.().events ?? this.events).filter((event) =>
+      matchesWaiter(event, options),
+    );
   }
 
   private scheduleResolve(waiter: Waiter): void {
@@ -160,7 +208,7 @@ export class ReviewEventQueue {
   private resolveWaiter(waiter: Waiter, timedOut: boolean): void {
     if (!this.waiters.has(waiter)) return;
 
-    this.waiters.delete(waiter);
+    this.removeWaiter(waiter);
     if (waiter.timeout) {
       clearTimeout(waiter.timeout);
     }
@@ -168,8 +216,27 @@ export class ReviewEventQueue {
       clearTimeout(waiter.batchTimeout);
     }
 
-    const events = timedOut ? [] : this.matchingEvents(waiter.options);
-    waiter.resolve(resultForEvents(events, timedOut, this.nextSequence));
+    try {
+      const events = timedOut ? [] : this.matchingEvents(waiter.options);
+      waiter.resolve(
+        resultForEvents(events, timedOut, this.latestSequence() + 1),
+      );
+    } catch (error) {
+      waiter.reject(error);
+    }
+  }
+  close(): void {
+    for (const waiter of [...this.waiters]) {
+      this.removeWaiter(waiter);
+      waiter.reject(new Error("Roughdraft server closed"));
+    }
+  }
+
+  private removeWaiter(waiter: Waiter): void {
+    this.waiters.delete(waiter);
+    if (waiter.timeout) clearTimeout(waiter.timeout);
+    if (waiter.batchTimeout) clearTimeout(waiter.batchTimeout);
+    waiter.stopAbort?.();
   }
 }
 
@@ -178,8 +245,9 @@ function normalizeWaitOptions(
 ): NormalizedWaitOptions {
   return {
     documentPath: options.documentPath
-      ? path.resolve(options.documentPath)
+      ? canonicalDocumentPath(options.documentPath)
       : undefined,
+    reviewId: options.reviewId,
     afterSequence: Math.max(0, options.afterSequence ?? 0),
     timeoutMs:
       options.timeoutMs !== undefined
@@ -198,8 +266,17 @@ function matchesWaiter(
   options: NormalizedWaitOptions,
 ): boolean {
   if (event.sequence <= options.afterSequence) return false;
+  if (options.reviewId && event.reviewId !== options.reviewId) return false;
   if (!options.documentPath) return true;
-  return path.resolve(event.documentPath) === options.documentPath;
+  return canonicalDocumentPath(event.documentPath) === options.documentPath;
+}
+
+function canonicalDocumentPath(documentPath: string): string {
+  try {
+    return fs.realpathSync(documentPath);
+  } catch {
+    return path.resolve(documentPath);
+  }
 }
 
 function resultForEvents(

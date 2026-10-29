@@ -97,6 +97,96 @@ describe("CriticMarkup comments", () => {
     expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
   });
 
+  it.each([
+    ["single line", " "],
+    ["line break", "\n"],
+    ["paragraph break", "\n\n"],
+    ["heading in comment", "\n\n## Comment heading\n\n"],
+    ["HTML in comment", "\n\n<details>\nExample\n</details>\n\n"],
+    [
+      "literal replacement characters",
+      "\n\n$& $` $$ \uE000roughdraft-comment-0\uE001\n\n",
+    ],
+  ])("preserves a %s in a saved inline comment after reopening", (_label, separator) => {
+    const input =
+      'Review {==target text==}{>>Initial comment<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"} here.\n';
+    const { doc, comments } = criticMarkdownToEditorState(input);
+    const content = `First paragraph.${separator}Second paragraph.`;
+    const comment = comments.get("c1");
+    if (!comment) throw new Error("Missing fixture comment");
+    comments.set("c1", { ...comment, content });
+
+    const saved = editorStateToCriticMarkdown(doc, comments);
+    expect(saved).toContain(`{>>${content}<<}`);
+    const reopened = criticMarkdownToEditorState(saved);
+    expect(reopened.comments.get("c1")).toMatchObject({ content });
+    expect(JSON.stringify(reopened.doc.content)).not.toContain("{>>");
+    expect(criticMarkdownHasReviewRail(saved)).toBe(true);
+    const rendered = criticMarkdownToRenderedHtml(saved);
+    expect(rendered.comments.get("c1")).toMatchObject({ content });
+    expect(rendered.html).not.toContain("{&gt;&gt;");
+  });
+
+  it.each([
+    "```",
+    "~~~",
+  ])("keeps paragraph-break comment examples inside %s fenced code literal", (fence) => {
+    const input = [
+      `${fence}markdown`,
+      "Literal {>>First paragraph.",
+      "",
+      'Second paragraph.<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"} here.',
+      fence,
+      "",
+    ].join("\n");
+    const { doc, comments } = criticMarkdownToEditorState(input);
+    expect(comments.size).toBe(0);
+    expect(criticMarkdownHasReviewRail(input)).toBe(false);
+    expect(editorStateToCriticMarkdown(doc, comments)).toBe(
+      input.replaceAll(fence, "```"),
+    );
+  });
+
+  it("keeps paragraph comments in raw HTML examples literal", () => {
+    const input =
+      '<details>\n<summary>Example</summary>\n\n{>>First paragraph.\n\nSecond paragraph.<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}\n\n</details>\n';
+    const { doc, comments } = criticMarkdownToEditorState(input);
+    expect(comments.size).toBe(0);
+    expect(criticMarkdownHasReviewRail(input)).toBe(false);
+    expect(editorStateToCriticMarkdown(doc, comments)).toBe(input);
+  });
+
+  it("keeps multiline standalone comment examples inside inline code literal", () => {
+    const input =
+      'Literal `{>>First paragraph.\nSecond paragraph.<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}` here.\n';
+    const { doc, comments } = criticMarkdownToEditorState(input);
+    expect(comments.size).toBe(0);
+    expect(criticMarkdownHasReviewRail(input)).toBe(false);
+    expect(JSON.stringify(doc.content)).toContain(
+      "First paragraph. Second paragraph.",
+    );
+    const rendered = criticMarkdownToRenderedHtml(input);
+    expect(rendered.html).toContain("<code>");
+    expect(rendered.html).not.toContain("data-comment-ids");
+  });
+
+  it("preserves paragraph breaks in a saved comment inside an ordered list", () => {
+    const input =
+      '1. Review {==target text==}{>>Initial comment<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"} here.\n2. Another item.\n';
+    const { doc, comments } = criticMarkdownToEditorState(input);
+    const content = "First paragraph.\n\nSecond paragraph.";
+    const comment = comments.get("c1");
+    if (!comment) throw new Error("Missing fixture comment");
+    comments.set("c1", { ...comment, content });
+    const saved = editorStateToCriticMarkdown(doc, comments);
+    const reopened = criticMarkdownToEditorState(saved);
+    expect(reopened.comments.get("c1")).toMatchObject({ content });
+    expect(reopened.doc.content?.[0]).toMatchObject({ type: "orderedList" });
+    expect(reopened.doc.content?.[0].content).toHaveLength(2);
+    expect(JSON.stringify(reopened.doc.content)).toContain("Another item.");
+    expect(JSON.stringify(reopened.doc.content)).not.toContain("{>>");
+  });
+
   it("renders YAML endmatter-backed root comments and replies", () => {
     const input = [
       "This is {==highlighted==}{>>comment text<<}{#c1} text.",
@@ -131,6 +221,53 @@ describe("CriticMarkup comments", () => {
     expect(output).toContain("{==highlighted==}{>>comment text<<}{#c1}");
     expect(output).toContain("body: Reply text");
     expect(output).toContain("re: c1");
+  });
+
+  it("preserves YAML replies to legacy inline comments through editor save and reopen", () => {
+    const input = [
+      "# Open questions",
+      'Review {==this==}{>>Needs detail<<}{id="c1" by="user" at="2026-04-28T12:00:00.000Z"}.',
+      "",
+      "---",
+      "comments:",
+      "  c2:",
+      "    body: I added context.",
+      "    by: AI",
+      '    at: "2026-04-28T12:01:00.000Z"',
+      "    re: c1",
+      "",
+    ].join("\n");
+    const { doc, comments, frontmatter, endmatter } =
+      criticMarkdownToEditorState(input);
+    const editor = new Editor({
+      extensions: createEditorExtensions(""),
+      content: doc,
+    });
+    try {
+      editor.commands.setTextSelection(15);
+      editor.commands.insertContent("!");
+      const saved = editorStateToCriticMarkdown(editor.getJSON(), comments, {
+        frontmatter,
+        endmatter,
+      });
+      const reopened = criticMarkdownToEditorState(saved);
+      expect(reopened.comments.get("c2")).toMatchObject({
+        content: "I added context.",
+        parentCommentId: "c1",
+        authorType: "ai",
+        createdAt: "2026-04-28T12:01:00.000Z",
+      });
+      expect(reopened.comments.get("c1")).toMatchObject({
+        content: "Needs detail",
+      });
+      expect(reopened.endmatter).toContain("    re: c1");
+      expect(JSON.stringify(reopened.doc.content)).not.toContain(
+        "I added context.",
+      );
+      expect(saved).not.toContain("* * *");
+    } finally {
+      editor.destroy();
+    }
   });
 
   it("does not treat horizontal rules and fenced YAML examples as review endmatter", () => {
