@@ -604,3 +604,132 @@ test("an old completion response cannot mark a newer loaded round Saved", async 
     release();
   }
 });
+
+for (const scoped of [false, true]) {
+  test(`restoration after a failed ${scoped ? "scoped" : "ordinary"} reopen restores saving`, async ({
+    page,
+    request,
+  }) => {
+    const file = path.join(scratch, `restore-reopen-${scoped}.md`);
+    fs.writeFileSync(file, "# Before disappearance\n");
+    const journalId = (await (await request.get(`${origin}/api/status`)).json())
+      .reviewEvents.journalId;
+    const first = {
+      storeId: "restore-store",
+      generation: 1,
+      reviewId: `restore-${scoped}-first`,
+      operationId: `restore-${scoped}-first-open`,
+    };
+    const second = {
+      ...first,
+      generation: 2,
+      reviewId: `restore-${scoped}-second`,
+      operationId: `restore-${scoped}-second-open`,
+    };
+    const url = `${origin}/?${new URLSearchParams({ path: file, editor: "code" })}`;
+    await observeOpeningStream(page);
+    if (scoped) {
+      const opened = await request.post(`${origin}/api/open-request`, {
+        data: {
+          path: file,
+          url,
+          journalId,
+          reviewContext: first,
+          loadRequestId: "restore-first",
+          notify: false,
+        },
+      });
+      expect(opened.status()).toBe(200);
+      await page.goto((await opened.json()).url);
+      await expect(page.getByTestId("review-handoff-button")).toBeEnabled();
+    } else await page.goto(url);
+    await watchConnection(page, true, "open-requests");
+    await watchConnection(page, true);
+    const editor = page
+      .getByTestId("markdown-code-editor")
+      .locator(".cm-content");
+    await expect(editor).toContainText("Before disappearance");
+    let removed = false;
+    await page.route(/\/api\/markdown-file(?:\?|$)/, async (route) => {
+      if (route.request().method() === "GET" && !removed) {
+        fs.unlinkSync(file);
+        removed = true;
+      }
+      await route.continue();
+    });
+    const failedRead = page.waitForResponse(
+      (response) =>
+        new URL(response.url()).pathname === "/api/markdown-file" &&
+        response.request().method() === "GET" &&
+        response.status() === 404,
+    );
+    const reopened = await request.post(`${origin}/api/open-request`, {
+      data: {
+        path: file,
+        url,
+        loadRequestId: `restore-second-${scoped}`,
+        ...(scoped ? { journalId, reviewContext: second } : {}),
+      },
+    });
+    expect(reopened.status()).toBe(200);
+    expect((await reopened.json()).delivered).toBe(true);
+    await (await failedRead).finished();
+    expect(removed).toBe(true);
+    expect(fs.existsSync(file)).toBe(false);
+    await expect(page.getByTestId("file-conflict-notice")).toBeVisible();
+    await expect(editor).toContainText("Before disappearance");
+    await expect
+      .poll(
+        async () =>
+          (
+            await (
+              await request.get(
+                `${origin}/api/open-request/load?id=restore-second-${scoped}`,
+              )
+            ).json()
+          ).load.status,
+      )
+      .toBe("failed");
+    fs.writeFileSync(file, "# Restored review\n");
+    await expect(editor).toContainText("Restored review");
+    await expect
+      .poll(
+        async () =>
+          (
+            await (
+              await request.get(
+                `${origin}/api/open-request/load?id=restore-second-${scoped}`,
+              )
+            ).json()
+          ).load.status,
+      )
+      .toBe("loaded");
+    await expect(page.getByTestId("file-conflict-notice")).toBeHidden();
+    await editor.click();
+    await page.keyboard.press("ControlOrMeta+End");
+    await page.keyboard.type("\nRecovered local review.\n");
+    await expect
+      .poll(() => fs.readFileSync(file, "utf8"))
+      .toContain("Recovered local review.");
+    await expect(page.getByTestId("document-save-status")).toHaveAttribute(
+      "aria-label",
+      "Saved",
+    );
+    if (scoped) {
+      const done = page.getByTestId("review-handoff-button");
+      await expect(done).toBeEnabled();
+      await done.click();
+      await expect(done).toHaveText("Saved");
+      const receipt = await request.post(`${origin}/api/review-events/watch`, {
+        data: {
+          journalId,
+          reviewId: second.reviewId,
+          afterSequence: 0,
+          fromNow: false,
+          timeoutSeconds: 0,
+        },
+      });
+      expect((await receipt.json()).events).toHaveLength(1);
+    }
+  });
+}

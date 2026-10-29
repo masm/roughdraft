@@ -2294,6 +2294,17 @@ export function App() {
           );
           return;
         }
+        if (
+          !reviewReadyRef.current &&
+          documentDiskChangeStateRef.current === "unavailable"
+        ) {
+          await loadDocument(
+            backend,
+            activeDocumentPath,
+            pendingOpeningRef.current,
+          );
+          return;
+        }
         const currentBinding =
           (await backend.getReviewContext?.(
             activeDocumentPath,
@@ -2378,6 +2389,7 @@ export function App() {
     activeDocumentPath,
     applyDocumentPage,
     backend,
+    loadDocument,
     setDocumentDiskChangeState,
     setReviewReady,
   ]);
