@@ -18,6 +18,29 @@ function eventInput(documentPath = "/tmp/project/draft.md") {
 }
 
 describe("ReviewEventQueue", () => {
+  it("rejects an outstanding wait if durable history becomes unavailable", async () => {
+    vi.useFakeTimers();
+    let unavailable = false;
+    const queue = new ReviewEventQueue({
+      history: () => {
+        if (unavailable) throw new Error("history unavailable");
+        return { events: [], nextSequence: 1 };
+      },
+    });
+    const waiting = queue.wait({ timeoutMs: 10 });
+    const rejected = expect(waiting).rejects.toThrow("history unavailable");
+    expect(queue.waiterCount()).toBe(1);
+    unavailable = true;
+    try {
+      await vi.advanceTimersByTimeAsync(10);
+      await rejected;
+      expect(queue.waiterCount()).toBe(0);
+    } finally {
+      queue.close();
+      vi.useRealTimers();
+    }
+  });
+
   it("queues events in creation order", async () => {
     const queue = new ReviewEventQueue();
 

@@ -184,13 +184,21 @@ describe("cli", () => {
         spawnCount += 1;
         const pid = nextPid;
         nextPid += 1;
-        const { app } = createApp({
+        const application = createApp({
+          homeDir: tempDir,
+          reviewStateDir: stateDir,
           port,
           projectDir: nextProjectDir,
           serverRoot,
           staticDirPath: nextProjectDir,
         });
-        const started = await listenOnLoopbackServers(port, app);
+        const transport = await listenOnLoopbackServers(port, application.app);
+        const started = {
+          close: async () => {
+            application.close();
+            await transport.close();
+          },
+        };
         runningPids.add(pid);
         serverByPid.set(pid, started);
         portByPid.set(pid, port);
@@ -1758,12 +1766,13 @@ describe("runCli open in remote mode", () => {
     url: string;
     close: () => Promise<void>;
   }> {
-    const { app } = createApp({
+    const application = createApp({
       homeDir: tempDir,
+      reviewStateDir: path.join(tempDir, "journal"),
       remoteDocumentToken,
       staticDirPath: tempDir,
     });
-    const server = createHttpServer(app);
+    const server = createHttpServer(application.app);
     await new Promise<void>((resolve) =>
       server.listen(0, "127.0.0.1", () => resolve()),
     );
@@ -1775,6 +1784,7 @@ describe("runCli open in remote mode", () => {
       url: `http://127.0.0.1:${address.port}`,
       close: () =>
         new Promise<void>((resolve) => {
+          application.close();
           server.closeAllConnections?.();
           server.close(() => resolve());
         }),

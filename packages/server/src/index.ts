@@ -16,6 +16,19 @@ import {
   resolveBindHosts,
 } from "./network.js";
 import { ReviewEventQueue } from "./review-events.js";
+import {
+  fileVersionFromContent,
+  fileVersionFromFile,
+  readFileSnapshot,
+} from "./file-version.js";
+import {
+  ReviewStore,
+  ReviewStateError,
+  parseReviewContext,
+  sameContext,
+  type ReviewContext,
+  type AcceptedReviewContext,
+} from "./review-store.js";
 import { resolveUpdateStatus } from "./update-status.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -67,11 +80,13 @@ interface CreateAppOptions {
   fetchImpl?: typeof fetch;
   packageName?: string;
   remoteDocumentToken?: string;
+  reviewStateDir?: string;
 }
 
 interface CreateAppResult {
   app: Express;
   port: number;
+  close: () => void;
 }
 
 interface OpenRequestClient {
@@ -154,20 +169,6 @@ function listMdFiles(projectDir: string): string[] {
 function titleFromContent(content: string, fallback: string): string {
   const firstLine = content.split("\n")[0] || "";
   return firstLine.replace(/^#*\s*/, "").trim() || fallback;
-}
-
-function fileVersionFromContent(
-  stats: fs.Stats,
-  content: string | Buffer,
-): string {
-  const contentHash = crypto.createHash("sha256").update(content).digest("hex");
-  return `${stats.mtimeMs}:${stats.size}:${contentHash}`;
-}
-
-function fileVersionFromFile(filePath: string): string {
-  const content = fs.readFileSync(filePath);
-  const stats = fs.statSync(filePath);
-  return fileVersionFromContent(stats, content);
 }
 
 function normalizeOverallComment(input: unknown): string | undefined {
@@ -405,7 +406,20 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       : null;
   const app = express();
   const openRequestClients = new Set<OpenRequestClient>();
-  const reviewEvents = new ReviewEventQueue();
+  let reviewStore: ReviewStore | undefined;
+  const getReviewStore = () => {
+    reviewStore ??= new ReviewStore(
+      options.reviewStateDir ?? path.join(homeDir, ".roughdraft"),
+    );
+    reviewStore.recoverIntents();
+    return reviewStore;
+  };
+  const reviewEvents = new ReviewEventQueue({
+    history: () => ({
+      events: getReviewStore().events(),
+      nextSequence: getReviewStore().snapshot().nextSequence,
+    }),
+  });
   const remoteSessions = new Map<string, RemoteSession>();
 
   function isAuthorizedRemoteDocumentRequest(req: Request): boolean {
@@ -514,6 +528,41 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     }
 
     return { relativePath, absolutePath, projectDir };
+  }
+
+  function canonicalPath(documentPath: string): string {
+    return fs.existsSync(documentPath)
+      ? fs.realpathSync(documentPath)
+      : path.resolve(documentPath);
+  }
+
+  function contextPath(input: unknown, mustExist = true): string {
+    if (
+      typeof input !== "string" ||
+      !path.isAbsolute(input) ||
+      !input.toLowerCase().endsWith(".md")
+    )
+      throw new ReviewStateError(
+        "invalid_request",
+        "An absolute Markdown path is required.",
+        400,
+      );
+    const resolved = canonicalPath(input);
+    if (
+      mustExist &&
+      (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile())
+    )
+      throw new ReviewStateError(
+        "recovery_unavailable",
+        "The requested Markdown file is unavailable.",
+      );
+    return resolved;
+  }
+
+  function scopedContext(req: Request): ReviewContext {
+    const store = getReviewStore();
+    store.assertJournal(req.body?.journalId);
+    return parseReviewContext(req.body?.reviewContext);
   }
 
   // --- API routes ---
@@ -637,9 +686,46 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   });
 
   app.post("/api/review-events", (req, res) => {
+    const store = getReviewStore();
+    const context =
+      req.body?.reviewContext === undefined ? undefined : scopedContext(req);
+    if (context) {
+      const previous = store.receipt(context.reviewId);
+      if (previous) {
+        if (
+          !previous.reviewContext ||
+          !sameContext(previous.reviewContext, context)
+        )
+          throw new ReviewStateError(
+            "stale_context",
+            "This receipt belongs to another opening operation.",
+          );
+        res.json({ delivered: false, event: previous, ...store.snapshot() });
+        return;
+      }
+    }
     const target = markdownPathFromRequest(req, res);
     if (!target) return;
-
+    const documentPath = canonicalPath(target.absolutePath);
+    const active = store.contextForPath(documentPath);
+    if (
+      !context &&
+      active &&
+      active.status !== "retired" &&
+      active.status !== "completed"
+    )
+      throw new ReviewStateError(
+        "stale_context",
+        "An unscoped client cannot complete this active plugin review.",
+      );
+    if (context) {
+      const accepted = store.requireCurrent(documentPath, context);
+      if (accepted.status !== "loaded")
+        throw new ReviewStateError(
+          "stale_context",
+          "The current review has not acknowledged successful document loading.",
+        );
+    }
     const overallComment = normalizeOverallComment(req.body?.overallComment);
     if (
       overallComment !== undefined &&
@@ -650,56 +736,163 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       });
       return;
     }
-
-    const markdown = fs.readFileSync(target.absolutePath, "utf-8");
-    const persistedMarkdown = overallComment
+    let snapshot: ReturnType<typeof readFileSnapshot>;
+    try {
+      snapshot = readFileSnapshot(target.absolutePath);
+    } catch {
+      throw new ReviewStateError(
+        "save_conflict",
+        "The saved Markdown could not be read consistently before completion.",
+      );
+    }
+    if (
+      context &&
+      (typeof req.body?.expectedVersion !== "string" ||
+        req.body.expectedVersion !== snapshot.version)
+    )
+      throw new ReviewStateError(
+        "save_conflict",
+        "The saved Markdown version changed before completion.",
+      );
+    const markdown = snapshot.content;
+    const createdAt = store.completionCreatedAt(context?.reviewId);
+    const persisted = overallComment
       ? appendRoughdraftDocumentComment(markdown, {
           message: overallComment,
           author: "user",
+          at: createdAt,
         })
       : markdown;
-    if (persistedMarkdown !== markdown) {
-      fs.writeFileSync(target.absolutePath, persistedMarkdown);
+    const savedVersion = snapshot.version;
+    const intent = store.prepareCompletion(
+      {
+        documentPath: context ? documentPath : target.absolutePath,
+        projectPath: context
+          ? canonicalPath(target.projectDir)
+          : target.projectDir,
+        relativePath: context
+          ? path.relative(canonicalPath(target.projectDir), documentPath)
+          : target.relativePath,
+        version: savedVersion,
+        summary: extractRoughdraftReviewIndex(persisted).summary,
+        ...(overallComment ? { overallComment } : {}),
+      },
+      markdown,
+      persisted,
+      context ? req.body.expectedVersion : savedVersion,
+      context,
+      createdAt,
+    );
+    try {
+      if (persisted !== markdown) {
+        const fd = fs.openSync(target.absolutePath, "r+");
+        try {
+          let current: ReturnType<typeof readFileSnapshot>;
+          try {
+            current = readFileSnapshot(fd);
+          } catch {
+            throw new ReviewStateError(
+              "save_conflict",
+              "Markdown changed before its completion write.",
+            );
+          }
+          if (current.version !== snapshot.version)
+            throw new ReviewStateError(
+              "save_conflict",
+              "Markdown changed before its completion write.",
+            );
+          const bytes = Buffer.from(persisted);
+          let written = 0;
+          while (written < bytes.length) {
+            const count = fs.writeSync(
+              fd,
+              bytes,
+              written,
+              bytes.length - written,
+              written,
+            );
+            if (count === 0) throw new Error("Markdown write made no progress");
+            written += count;
+          }
+          fs.ftruncateSync(fd, bytes.length);
+          fs.fsyncSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
+      }
+      const event = store.finishCompletion(intent);
+      const delivered = reviewEvents.publish(event);
+      res.status(201).json({ delivered, event, ...store.snapshot() });
+    } catch (error) {
+      if (error instanceof ReviewStateError) throw error;
+      throw new ReviewStateError(
+        "receipt_unavailable",
+        "The completion was not confirmed; saved feedback is preserved for recovery.",
+        503,
+      );
     }
-
-    const index = extractRoughdraftReviewIndex(persistedMarkdown);
-    const result = reviewEvents.emit({
-      documentPath: target.absolutePath,
-      projectPath: target.projectDir,
-      relativePath: target.relativePath,
-      version: fileVersionFromFile(target.absolutePath),
-      summary: index.summary,
-      overallComment,
-    });
-
-    res.status(201).json(result);
   });
 
   app.post("/api/review-events/watch", async (req, res) => {
-    const target = markdownPathFromRequest(req, res);
-    if (!target) return;
-
+    const store = getReviewStore();
+    const reviewId = req.body?.reviewId;
+    if (req.body?.journalId !== undefined || reviewId !== undefined)
+      store.assertJournal(req.body?.journalId);
+    if (reviewId !== undefined && typeof reviewId !== "string")
+      throw new ReviewStateError(
+        "invalid_request",
+        "reviewId must be a string.",
+        400,
+      );
+    let documentPath: string | undefined;
+    if (reviewId) store.assertRecoverableReview(reviewId);
+    else {
+      const target = markdownPathFromRequest(req, res);
+      if (!target) return;
+      documentPath = target.absolutePath;
+    }
     const fromNow = req.body?.fromNow !== false;
     const timeoutSeconds =
       typeof req.body?.timeoutSeconds === "number"
         ? req.body.timeoutSeconds
-        : undefined;
-    const batchWindowSeconds =
-      typeof req.body?.batchWindowSeconds === "number"
-        ? req.body.batchWindowSeconds
-        : 0.25;
+        : reviewId
+          ? 240
+          : undefined;
     const afterSequence =
       typeof req.body?.afterSequence === "number" ? req.body.afterSequence : 0;
-
-    const result = await reviewEvents.wait({
-      documentPath: target.absolutePath,
-      afterSequence: fromNow ? reviewEvents.latestSequence() : afterSequence,
-      timeoutMs:
-        timeoutSeconds !== undefined ? timeoutSeconds * 1000 : undefined,
-      batchWindowMs: batchWindowSeconds * 1000,
-    });
-
-    res.json(result);
+    if (
+      reviewId &&
+      (!Number.isSafeInteger(afterSequence) ||
+        afterSequence < 0 ||
+        afterSequence > store.snapshot().latestSequence)
+    )
+      throw new ReviewStateError(
+        "recovery_unavailable",
+        "The review cursor is outside this journal.",
+      );
+    const controller = new AbortController();
+    const disconnected = () => {
+      if (!res.writableEnded)
+        controller.abort(new Error("Review watcher disconnected"));
+    };
+    res.once("close", disconnected);
+    try {
+      const result = await reviewEvents.wait({
+        documentPath,
+        reviewId,
+        afterSequence: fromNow ? reviewEvents.latestSequence() : afterSequence,
+        timeoutMs:
+          timeoutSeconds === undefined ? undefined : timeoutSeconds * 1000,
+        batchWindowMs:
+          typeof req.body?.batchWindowSeconds === "number"
+            ? req.body.batchWindowSeconds * 1000
+            : 250,
+        signal: controller.signal,
+      });
+      if (!res.destroyed) res.json({ ...result, ...store.snapshot() });
+    } finally {
+      res.removeListener("close", disconnected);
+    }
   });
 
   app.get("/api/review-events/status", (req, res) => {
@@ -751,10 +944,38 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
+    const store = getReviewStore();
+    const documentPath = canonicalPath(absolutePath);
+    const context =
+      req.body?.reviewContext === undefined ? undefined : scopedContext(req);
+    const active = store.contextForPath(documentPath);
+    if (
+      !context &&
+      active &&
+      active.status !== "retired" &&
+      active.status !== "completed"
+    )
+      throw new ReviewStateError(
+        "stale_context",
+        "An unscoped client cannot save this active plugin review.",
+      );
+    if (
+      context &&
+      store.requireCurrent(documentPath, context).status !== "loaded"
+    )
+      throw new ReviewStateError(
+        "stale_context",
+        "This context is not an active loaded review.",
+      );
     const { content, expectedVersion } = req.body as {
       content: string;
       expectedVersion?: string;
     };
+    if (context && typeof expectedVersion !== "string")
+      throw new ReviewStateError(
+        "save_conflict",
+        "A scoped save requires the version it edits.",
+      );
     const currentVersion = fileVersionFromFile(absolutePath);
 
     if (expectedVersion && expectedVersion !== currentVersion) {
@@ -801,7 +1022,9 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   });
 
   app.get("/api/status", (_req, res) => {
+    const journal = getReviewStore().snapshot();
     res.json({
+      reviewEvents: journal,
       backend: "local-files",
       pid: process.pid,
       port,
@@ -811,6 +1034,8 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       serverRoot,
       stateless: true,
       capabilities: {
+        durableReviewEvents: 1,
+        reviewContext: 1,
         projectPathRequired: true,
         fileSystemBrowsing: true,
         remoteDocuments: true,
@@ -850,38 +1075,97 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     });
   });
 
+  app.get("/api/open-request", (req, res) => {
+    const store = getReviewStore();
+    store.assertJournal(req.query.journalId);
+    const documentPath = contextPath(req.query.path, false);
+    res.json({
+      ...store.snapshot(),
+      context: store.contextForPath(documentPath),
+    });
+  });
+
+  app.post("/api/open-request/ack", (req, res) => {
+    const store = getReviewStore();
+    const context = scopedContext(req);
+    const documentPath = contextPath(req.body?.path);
+    store.requireCurrent(documentPath, context);
+    if (
+      typeof req.body?.version !== "string" ||
+      req.body.version !== fileVersionFromFile(documentPath)
+    )
+      throw new ReviewStateError(
+        "save_conflict",
+        "The loaded document version is no longer current.",
+      );
+    res.json({
+      ...store.snapshot(),
+      context: store.acknowledge(documentPath, context, req.body.version),
+    });
+  });
+
+  app.post("/api/open-request/retire", (req, res) => {
+    const store = getReviewStore();
+    const context = scopedContext(req);
+    res.json({
+      ...store.snapshot(),
+      context: store.retire(contextPath(req.body?.path, false), context),
+    });
+  });
+
   app.post("/api/open-request", (req, res) => {
     const payload = req.body as OpenRequestPayload;
-    const targetPath =
-      typeof payload.path === "string" && payload.path.trim().length > 0
+    const rawPath =
+      typeof payload.path === "string" && payload.path.trim()
         ? payload.path.trim()
         : null;
     const targetUrl =
-      typeof payload.url === "string" && payload.url.trim().length > 0
+      typeof payload.url === "string" && payload.url.trim()
         ? payload.url.trim()
         : null;
-
-    if (!targetPath || !targetUrl) {
+    if (!rawPath || !targetUrl) {
       res.status(400).json({ error: "path and url are required" });
       return;
     }
-
+    const targetPath = canonicalPath(rawPath);
+    let accepted: AcceptedReviewContext | undefined;
+    if (req.body?.reviewContext !== undefined) {
+      const context = scopedContext(req);
+      contextPath(rawPath);
+      accepted = getReviewStore().prepare(
+        targetPath,
+        path.dirname(targetPath),
+        path.basename(targetPath),
+        context,
+      );
+    } else {
+      const current = getReviewStore().contextForPath(targetPath);
+      if (current?.status === "opening" || current?.status === "loaded")
+        accepted = current;
+    }
     const matchingClient = Array.from(openRequestClients)
       .reverse()
-      .find((client) => client.path === targetPath);
-
-    if (!matchingClient) {
-      res.json({ delivered: false });
-      return;
+      .find(
+        (client) =>
+          client.path !== null && canonicalPath(client.path) === targetPath,
+      );
+    let delivered = false;
+    if (
+      matchingClient &&
+      accepted?.status !== "completed" &&
+      accepted?.status !== "retired"
+    ) {
+      matchingClient.response.write(
+        `event: open-request\ndata: ${JSON.stringify({ path: targetPath, url: targetUrl, ...(accepted ? { reviewContext: accepted } : {}) })}\n\n`,
+      );
+      delivered = true;
     }
-
-    matchingClient.response.write(
-      `event: open-request\ndata: ${JSON.stringify({
-        path: targetPath,
-        url: targetUrl,
-      })}\n\n`,
-    );
-    res.json({ delivered: true });
+    res.json({
+      delivered,
+      ...(accepted
+        ? { context: accepted, ...getReviewStore().snapshot() }
+        : {}),
+    });
   });
 
   app.post("/api/remote-document", (req, res) => {
@@ -1226,6 +1510,24 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     });
   });
 
+  app.use(
+    (
+      error: unknown,
+      _req: Request,
+      res: Response,
+      next: (error?: unknown) => void,
+    ) => {
+      if (res.destroyed) return;
+      if (error instanceof ReviewStateError) {
+        res
+          .status(error.status)
+          .json({ code: error.code, error: error.message });
+        return;
+      }
+      next(error);
+    },
+  );
+
   // --- Static files & SPA fallback ---
 
   app.use(express.static(staticDirPath));
@@ -1234,7 +1536,17 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     res.sendFile(path.join(staticDirPath, "index.html"));
   });
 
-  return { app, port };
+  return {
+    app,
+    port,
+    close: () => {
+      reviewEvents.close();
+      for (const client of openRequestClients) client.response.end();
+      openRequestClients.clear();
+      clearInterval(remoteSessionSweeper);
+      reviewStore?.close();
+    },
+  };
 }
 
 export const ROUGHDRAFT_TOKEN_ENV = "ROUGHDRAFT_TOKEN";
@@ -1261,6 +1573,9 @@ export async function createServer(
   const { app } = createApp({
     port,
     projectDir,
+    reviewStateDir: process.env.ROUGHDRAFT_STATE_FILE
+      ? path.dirname(path.resolve(process.env.ROUGHDRAFT_STATE_FILE))
+      : process.env.ROUGHDRAFT_STATE_DIR,
     remoteDocumentToken:
       remoteDocumentToken.length > 0 ? remoteDocumentToken : undefined,
   });

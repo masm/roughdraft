@@ -5,11 +5,21 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { createApp } from "./index";
+import { createApp as createServerApp } from "./index";
 
 describe("createApp", () => {
   let projectDir: string;
   let homeDir: string;
+  const applications: ReturnType<typeof createServerApp>[] = [];
+  function createApp(options: Parameters<typeof createServerApp>[0]) {
+    const application = createServerApp({
+      ...options,
+      homeDir,
+      reviewStateDir: path.join(homeDir, "journal"),
+    });
+    applications.push(application);
+    return application;
+  }
   const serverRoot = path.resolve(
     fileURLToPath(new URL("../../..", import.meta.url)),
   );
@@ -20,6 +30,7 @@ describe("createApp", () => {
   });
 
   afterEach(() => {
+    for (const application of applications.splice(0)) application.close();
     fs.rmSync(projectDir, { recursive: true, force: true });
     fs.rmSync(homeDir, { recursive: true, force: true });
   });
@@ -541,7 +552,16 @@ describe("createApp", () => {
       port: 4312,
       serverRoot,
       stateless: true,
+      reviewEvents: {
+        journalId: expect.any(String),
+        startId: expect.any(String),
+        latestSequence: 0,
+        earliestSequence: 0,
+        nextSequence: 1,
+      },
       capabilities: {
+        durableReviewEvents: 1,
+        reviewContext: 1,
         projectPathRequired: true,
         fileSystemBrowsing: true,
         remoteDocuments: true,
@@ -922,6 +942,7 @@ describe("createApp", () => {
     expect(noTokenStatus.body.capabilities.remoteDocumentTokenRequired).toBe(
       false,
     );
+    noTokenApp.close();
 
     const tokenApp = createApp({
       homeDir,
