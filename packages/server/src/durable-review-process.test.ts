@@ -14,6 +14,12 @@ const loader = fileURLToPath(
 const storeUrl = pathToFileURL(
   fileURLToPath(new URL("./review-store.ts", import.meta.url)),
 ).href;
+const completionUrl = pathToFileURL(
+  fileURLToPath(new URL("./completion-file.ts", import.meta.url)),
+).href;
+const snapshotUrl = pathToFileURL(
+  fileURLToPath(new URL("./file-version.ts", import.meta.url)),
+).href;
 
 function child(script: string, cwd: string) {
   const process = spawn(
@@ -120,12 +126,13 @@ it("recovers the write-to-receipt crash gap after an actual process kill", async
     operationId: "process-open",
   };
   const killed = child(
-    `import fs from "node:fs"; import { ReviewStore } from ${JSON.stringify(storeUrl)}; const store = new ReviewStore(${JSON.stringify(directory)}); const context = ${JSON.stringify(context)}; store.prepare(${JSON.stringify(documentPath)}, ${JSON.stringify(scratch)}, "draft.md", context); store.acknowledge(${JSON.stringify(documentPath)}, context, "injected-saved-version"); store.prepareCompletion({documentPath:${JSON.stringify(documentPath)}, projectPath:${JSON.stringify(scratch)}, relativePath:"draft.md",version:"injected-saved-version",summary:{comments:1,replies:0,suggestions:0,unresolved:1},overallComment:"Crash handoff."},${JSON.stringify(before)},${JSON.stringify(after)},"injected-saved-version",context); const fd=fs.openSync(${JSON.stringify(documentPath)},"w");fs.writeFileSync(fd,${JSON.stringify(after)});fs.fsyncSync(fd);fs.closeSync(fd); console.log(JSON.stringify(store.snapshot())); process.kill(process.pid,"SIGKILL");`,
+    `import fs from "node:fs"; import { ReviewStore } from ${JSON.stringify(storeUrl)}; import { replaceCompletionFile } from ${JSON.stringify(completionUrl)}; import { readFileSnapshot } from ${JSON.stringify(snapshotUrl)}; const store = new ReviewStore(${JSON.stringify(directory)}); const context = ${JSON.stringify(context)}; store.prepare(${JSON.stringify(documentPath)}, ${JSON.stringify(scratch)}, "draft.md", context); store.acknowledge(${JSON.stringify(documentPath)}, context, "injected-saved-version"); store.prepareCompletion({documentPath:${JSON.stringify(documentPath)}, projectPath:${JSON.stringify(scratch)}, relativePath:"draft.md",version:"injected-saved-version",summary:{comments:1,replies:0,suggestions:0,unresolved:1},overallComment:"Crash handoff."},${JSON.stringify(before)},${JSON.stringify(after)},"injected-saved-version",context); const snapshot=readFileSnapshot(${JSON.stringify(documentPath)}); replaceCompletionFile(${JSON.stringify(documentPath)},fs.realpathSync(${JSON.stringify(documentPath)}),snapshot,${JSON.stringify(after)}); console.log(JSON.stringify({...store.snapshot(),replacementVisible:fs.statSync(${JSON.stringify(documentPath)}).ino!==snapshot.stats.ino})); process.kill(process.pid,"SIGKILL");`,
     scratch,
   );
   let recovered: ReturnType<typeof createApp> | undefined;
   try {
     const metadata = await killed.firstLine;
+    expect(metadata.replacementVisible).toBe(true);
     expect((await killed.exited).signal).toBe("SIGKILL");
     expect(fs.readFileSync(documentPath, "utf8")).toBe(after);
     recovered = createApp({ homeDir: scratch, reviewStateDir: directory });

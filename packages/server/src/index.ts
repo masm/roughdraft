@@ -15,7 +15,11 @@ import {
   ROUGHDRAFT_PUBLIC_HOST,
   resolveBindHosts,
 } from "./network.js";
-import { ReviewEventQueue } from "./review-events.js";
+import {
+  ReviewEventQueue,
+  type ReviewCompletedEvent,
+} from "./review-events.js";
+import { replaceCompletionFile } from "./completion-file.js";
 import {
   fileVersionFromContent,
   fileVersionFromFile,
@@ -407,11 +411,16 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   const app = express();
   const openRequestClients = new Set<OpenRequestClient>();
   let reviewStore: ReviewStore | undefined;
-  const getReviewStore = () => {
+  const getReviewStore = (
+    onRecovered?: (event: ReviewCompletedEvent, delivered: boolean) => void,
+  ) => {
     reviewStore ??= new ReviewStore(
       options.reviewStateDir ?? path.join(homeDir, ".roughdraft"),
     );
-    reviewStore.recoverIntents();
+    for (const event of reviewStore.recoverIntents()) {
+      const delivered = reviewEvents.publish(event);
+      onRecovered?.(event, delivered);
+    }
     return reviewStore;
   };
   const reviewEvents = new ReviewEventQueue({
@@ -686,7 +695,10 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
   });
 
   app.post("/api/review-events", (req, res) => {
-    const store = getReviewStore();
+    const recoveryDeliveries = new Map<string, boolean>();
+    const store = getReviewStore((event, delivered) => {
+      if (event.eventId) recoveryDeliveries.set(event.eventId, delivered);
+    });
     const context =
       req.body?.reviewContext === undefined ? undefined : scopedContext(req);
     if (context) {
@@ -700,7 +712,13 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
             "stale_context",
             "This receipt belongs to another opening operation.",
           );
-        res.json({ delivered: false, event: previous, ...store.snapshot() });
+        res.json({
+          delivered:
+            previous.eventId !== undefined &&
+            recoveryDeliveries.get(previous.eventId) === true,
+          event: previous,
+          ...store.snapshot(),
+        });
         return;
       }
     }
@@ -784,42 +802,13 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       createdAt,
     );
     try {
-      if (persisted !== markdown) {
-        const fd = fs.openSync(target.absolutePath, "r+");
-        try {
-          let current: ReturnType<typeof readFileSnapshot>;
-          try {
-            current = readFileSnapshot(fd);
-          } catch {
-            throw new ReviewStateError(
-              "save_conflict",
-              "Markdown changed before its completion write.",
-            );
-          }
-          if (current.version !== snapshot.version)
-            throw new ReviewStateError(
-              "save_conflict",
-              "Markdown changed before its completion write.",
-            );
-          const bytes = Buffer.from(persisted);
-          let written = 0;
-          while (written < bytes.length) {
-            const count = fs.writeSync(
-              fd,
-              bytes,
-              written,
-              bytes.length - written,
-              written,
-            );
-            if (count === 0) throw new Error("Markdown write made no progress");
-            written += count;
-          }
-          fs.ftruncateSync(fd, bytes.length);
-          fs.fsyncSync(fd);
-        } finally {
-          fs.closeSync(fd);
-        }
-      }
+      if (persisted !== markdown)
+        replaceCompletionFile(
+          target.absolutePath,
+          documentPath,
+          snapshot,
+          persisted,
+        );
       const event = store.finishCompletion(intent);
       const delivered = reviewEvents.publish(event);
       res.status(201).json({ delivered, event, ...store.snapshot() });
@@ -978,7 +967,10 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       );
     const currentVersion = fileVersionFromFile(absolutePath);
 
-    if (expectedVersion && expectedVersion !== currentVersion) {
+    if (
+      (context !== undefined || expectedVersion) &&
+      expectedVersion !== currentVersion
+    ) {
       res.status(409).json({
         error: "Markdown file changed on disk",
         current: markdownPageFromFile(relativePath, absolutePath),

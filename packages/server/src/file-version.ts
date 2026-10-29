@@ -12,6 +12,7 @@ export function fileVersionFromContent(
 export function readFileSnapshot(filePath: string | number): {
   content: string;
   version: string;
+  stats: fs.Stats;
 } {
   const fd =
     typeof filePath === "number" ? filePath : fs.openSync(filePath, "r");
@@ -28,7 +29,11 @@ export function readFileSnapshot(filePath: string | number): {
       Buffer.byteLength(content) !== before.size
     )
       throw new Error("Markdown changed while its snapshot was being read");
-    return { content, version: fileVersionFromContent(before, content) };
+    return {
+      content,
+      version: fileVersionFromContent(before, content),
+      stats: before,
+    };
   } finally {
     if (typeof filePath !== "number") fs.closeSync(fd);
   }

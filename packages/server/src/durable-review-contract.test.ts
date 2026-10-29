@@ -299,15 +299,17 @@ it("preserves new external content and leaves the round unfinished when the save
   expect(waiting.body.timedOut).toBe(true);
 });
 
-it("reconciles a durable intent after a post-write sync failure without duplicating its comment", async () => {
+it("reconciles a durable intent after a post-visible replacement failure without duplicating its comment", async () => {
   const first = application();
   const { journalId } = await prepare(first);
   const expectedVersion = await acknowledge(first, journalId);
-  const originalSync = fs.fsyncSync;
-  const sync = vi.spyOn(fs, "fsyncSync").mockImplementationOnce((fd) => {
-    originalSync(fd);
-    throw new Error("post-write sync fault");
-  });
+  const originalRename = fs.renameSync;
+  const sync = vi
+    .spyOn(fs, "renameSync")
+    .mockImplementationOnce((source, destination) => {
+      originalRename(source, destination);
+      throw new Error("post-visible replacement fault");
+    });
   const body = {
     projectPath: projectDir,
     path: "draft.md",
@@ -317,6 +319,7 @@ it("reconciles a durable intent after a post-write sync failure without duplicat
     overallComment: "Recovered handoff.",
   };
   const failed = await request(first.app).post("/api/review-events").send(body);
+  expect(sync).toHaveBeenCalledTimes(1);
   expect(failed.status).toBe(503);
   expect(failed.body.code).toBe("receipt_unavailable");
   sync.mockRestore();
@@ -763,7 +766,11 @@ it("retries a pre-write failure with the original comment timestamp after restar
     flags: string | number,
     mode?: fs.Mode,
   ) => {
-    if (String(target) === file && flags === "r+" && !refusedWrite) {
+    if (
+      String(target).includes(".roughdraft-") &&
+      flags === "wx" &&
+      !refusedWrite
+    ) {
       refusedWrite = true;
       throw new Error("pre-write failure");
     }
@@ -927,23 +934,19 @@ it("preserves an active scoped context on the first unscoped open after restart"
   expect(reopened.body.journalId).toBe(journalId);
 });
 
-it("preserves an external edit that arrives after intent preparation but before opening the write descriptor", async () => {
+it("preserves an external edit that arrives while preparing the replacement", async () => {
   const value = application();
   const { journalId } = await prepare(value);
   const expectedVersion = await acknowledge(value, journalId);
-  const originalOpen = fs.openSync;
+  const originalSync = fs.fsyncSync;
   let changed = false;
-  const opener = vi.spyOn(fs, "openSync").mockImplementation(((
-    target: fs.PathLike,
-    flags: string | number,
-    mode?: fs.Mode,
-  ) => {
-    if (String(target) === file && flags === "r+" && !changed) {
+  const opener = vi.spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+    originalSync(fd);
+    if (!changed && fs.fstatSync(fd).isFile()) {
       changed = true;
       fs.writeFileSync(file, "# External edit before write\n");
     }
-    return originalOpen(target, flags, mode);
-  }) as typeof fs.openSync);
+  });
   const completed = await request(value.app).post("/api/review-events").send({
     projectPath: projectDir,
     path: "draft.md",

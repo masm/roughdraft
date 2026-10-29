@@ -178,7 +178,7 @@ export class ReviewEventQueue {
   }
 
   waiterCountForDocument(documentPath: string): number {
-    const normalizedPath = path.resolve(documentPath);
+    const normalizedPath = canonicalDocumentPath(documentPath);
     return [...this.waiters].filter(
       (waiter) => waiter.options.documentPath === normalizedPath,
     ).length;
@@ -245,7 +245,7 @@ function normalizeWaitOptions(
 ): NormalizedWaitOptions {
   return {
     documentPath: options.documentPath
-      ? path.resolve(options.documentPath)
+      ? canonicalDocumentPath(options.documentPath)
       : undefined,
     reviewId: options.reviewId,
     afterSequence: Math.max(0, options.afterSequence ?? 0),
@@ -268,7 +268,15 @@ function matchesWaiter(
   if (event.sequence <= options.afterSequence) return false;
   if (options.reviewId && event.reviewId !== options.reviewId) return false;
   if (!options.documentPath) return true;
-  return path.resolve(event.documentPath) === options.documentPath;
+  return canonicalDocumentPath(event.documentPath) === options.documentPath;
+}
+
+function canonicalDocumentPath(documentPath: string): string {
+  try {
+    return fs.realpathSync(documentPath);
+  } catch {
+    return path.resolve(documentPath);
+  }
 }
 
 function resultForEvents(

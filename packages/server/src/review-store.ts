@@ -658,8 +658,9 @@ export class ReviewStore {
     return this.decorate(event);
   }
 
-  recoverIntents(): void {
+  recoverIntents(): ReviewCompletedEvent[] {
     this.assertBackingFile();
+    const recovered: ReviewCompletedEvent[] = [];
     for (const row of this.database
       .prepare("SELECT payload FROM intents")
       .all()) {
@@ -669,12 +670,13 @@ export class ReviewStore {
           contentHash(fs.readFileSync(intent.input.documentPath, "utf8")) ===
           intent.afterHash
         )
-          this.finishCompletion(intent);
+          recovered.push(this.finishCompletion(intent));
       } catch (error) {
         if (!(error instanceof ReviewStateError)) continue;
         if (error.code !== "recovery_unavailable") throw error;
       }
     }
+    return recovered;
   }
 
   assertRecoverableReview(reviewId: string): void {

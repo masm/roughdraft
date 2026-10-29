@@ -10,7 +10,7 @@ An in-memory completion queue loses finished reviews on restart. A path alone ca
 
 Use Node's built-in SQLite module with transactions and one exclusive writer connection. Persist journal identity, monotonic sequence, accepted context generations, completion intents and receipts. Retain metadata without automatic expiry; reject malformed/lost required state explicitly. Keep feedback bodies in Markdown and store only summaries and digests in the journal.
 
-Commit a completion intent before touching Markdown. Reuse its timestamp on retry and reconcile its before/after content hashes after interruption. Publish success only after the receipt commits. See the [HTTP contract](../spec/review-events.md) for requests, errors and recovery.
+Commit a completion intent before touching Markdown. Reuse its timestamp on retry and reconcile its before/after content hashes after interruption. Use a fully synced temporary sibling and atomic target replacement for an overall-comment write, preserving the original on pre-replacement failure. Publish success only after the receipt commits, including waking existing watchers on recovery. See the [HTTP contract](../spec/review-events.md) for requests, errors and recovery.
 
 ## Consequences
 
