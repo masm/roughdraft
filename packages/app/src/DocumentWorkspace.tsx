@@ -474,6 +474,20 @@ export function DocumentWorkspace({
   const copiedFileActionTimeoutRef = useRef<number | null>(null);
   const saveControllerRef = useRef<DocumentSaveController | null>(null);
   const documentChangeTrackingReadyRef = useRef(false);
+  const handoffIdentity = JSON.stringify([
+    backend?.info.projectPath,
+    activeDocumentPath,
+    documentPage?.id,
+    reviewId,
+  ]);
+  const handoffIdentityRef = useRef<string | null>(handoffIdentity);
+  handoffIdentityRef.current = handoffIdentity;
+  useEffect(() => {
+    handoffIdentityRef.current = handoffIdentity;
+    return () => {
+      handoffIdentityRef.current = null;
+    };
+  }, [handoffIdentity]);
 
   const handleSaveStateChange = useCallback(
     (state: DocumentSaveState) => {
@@ -609,11 +623,14 @@ export function DocumentWorkspace({
     async (options?: CompleteReviewOptions) => {
       if (!activeDocumentPath || reviewHandoffState === "notifying") return;
 
+      const identity = handoffIdentity;
+      const isCurrent = () => handoffIdentityRef.current === identity;
       setReviewHandoffState("notifying");
       try {
         // The button stays enabled while autosave is still pending, so make
         // sure any debounced edits are persisted before handing off.
         const flushResult = await saveControllerRef.current?.flushSave();
+        if (!isCurrent()) return;
         if (flushResult && flushResult.status === "error") {
           throw flushResult.error;
         }
@@ -621,6 +638,7 @@ export function DocumentWorkspace({
         if (!reviewReady || documentDiskChangeState !== "clean")
           throw new Error("Resolve this document before completing review.");
         const result = await onCompleteReview(options);
+        if (!isCurrent()) return;
         if (result.recorded && !result.delivered) {
           setReviewWatcherCount(0);
           setReviewHandoffState("recorded");
@@ -637,6 +655,7 @@ export function DocumentWorkspace({
           setReviewHandoffPopoverOpen(true);
         }
       } catch (error) {
+        if (!isCurrent()) return;
         console.error("Failed to complete review:", error);
         setReviewHandoffState("error");
         setReviewHandoffPopoverOpen(true);
@@ -644,6 +663,7 @@ export function DocumentWorkspace({
     },
     [
       activeDocumentPath,
+      handoffIdentity,
       onCompleteReview,
       reviewHandoffState,
       reviewReady,

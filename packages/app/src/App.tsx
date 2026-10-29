@@ -1583,6 +1583,7 @@ export function App() {
         review?: RequestedReview;
         loadRequestId?: string;
         discardDraft?: boolean;
+        preserveDraft?: boolean;
       } = {},
     ) => {
       const lifecycle = lifecycleRef.current;
@@ -1614,7 +1615,10 @@ export function App() {
         epoch = ++loadRevisionRef.current;
         refreshRevisionRef.current += 1;
         const revision = contentRevisionRef.current;
-        pendingOpeningRef.current = opening;
+        pendingOpeningRef.current = {
+          review: opening.review,
+          loadRequestId: opening.loadRequestId,
+        };
         setReviewReady(false);
         const nextDocument = await nextBackend.getMarkdownFile(relativePath);
         const confirmedContext =
@@ -1640,7 +1644,9 @@ export function App() {
           throw new Error("A newer opening replaced this document load.");
         if (
           revision !== contentRevisionRef.current ||
-          (!opening.discardDraft && documentDirtyRef.current)
+          (!opening.discardDraft &&
+            !opening.preserveDraft &&
+            documentDirtyRef.current)
         ) {
           setDocumentDiskChangeState("changed");
           throw new Error(
@@ -1664,7 +1670,7 @@ export function App() {
           throw new Error(
             "The document changed before load acknowledgment completed.",
           );
-        applyDocumentPage(nextDocument);
+        if (!opening.preserveDraft) applyDocumentPage(nextDocument);
         activeDocumentPathRef.current = relativePath;
         setActiveDocumentPath(relativePath);
         const loaded = accepted
@@ -1683,9 +1689,11 @@ export function App() {
         reviewBindingRef.current = loaded;
         if (loaded?.status === "completed") completedReviewRef.current = loaded;
         setReviewBinding(loaded);
-        documentDirtyRef.current = false;
+        if (!opening.preserveDraft) {
+          documentDirtyRef.current = false;
+          setDocumentDiskChangeState("clean");
+        }
         setDocumentProblem(null);
-        setDocumentDiskChangeState("clean");
         setReviewReady(true);
         return nextDocument;
       } catch (error) {
@@ -2073,6 +2081,15 @@ export function App() {
 
     const content = documentDraftContentRef.current ?? currentDocument.content;
     const revision = contentRevisionRef.current;
+    if (!reviewReadyRef.current)
+      await loadDocument(currentBackend, currentPath, {
+        ...pendingOpeningRef.current,
+        preserveDraft: true,
+      });
+    if (revision !== contentRevisionRef.current)
+      throw new Error(
+        "Your draft changed while resolving the opening. Retry overwrite.",
+      );
     const savedDocument = await saveConfirmedDocument(
       currentBackend,
       currentPath,
@@ -2091,6 +2108,7 @@ export function App() {
   }, [
     applyDocumentPage,
     handleDocumentSaveStateChange,
+    loadDocument,
     saveConfirmedDocument,
     setDocumentDiskChangeState,
   ]);
@@ -2102,10 +2120,18 @@ export function App() {
       const currentDocument = documentPageRef.current;
       if (!currentBackend || !currentPath || !currentDocument)
         throw new Error("The document backend is unavailable.");
+      const completionEpoch = loadRevisionRef.current;
       const finish = (
         result: CompleteReviewResult,
         binding: ReviewBinding | null,
       ) => {
+        if (
+          completionEpoch !== loadRevisionRef.current ||
+          currentBackend !== backendRef.current ||
+          currentPath !== activeDocumentPathRef.current ||
+          !sameRequestedReview(binding, reviewBindingRef.current)
+        )
+          throw new Error("A newer document opening replaced this completion.");
         if (result.recorded && binding) completedReviewRef.current = binding;
         pendingCompletionRef.current = null;
         return result;

@@ -362,3 +362,245 @@ test("retries a scoped receipt after its successful HTTP response was lost", asy
     fs.readFileSync(file, "utf8").match(/Response-loss comment\./g),
   ).toHaveLength(1);
 });
+
+async function observeOpeningStream(page: Page) {
+  await page.addInitScript(() => {
+    const Native = window.EventSource;
+    (window as unknown as { refreshSources: EventSource[] }).refreshSources =
+      [];
+    window.EventSource = class extends Native {
+      constructor(url: string | URL, options?: EventSourceInit) {
+        super(url, options);
+        (
+          window as unknown as { refreshSources: EventSource[] }
+        ).refreshSources.push(this);
+      }
+    };
+  });
+}
+
+for (const scoped of [false, true]) {
+  test(`explicit overwrite resolves a dirty same-path ${scoped ? "new scoped round" : "ordinary reopen"}`, async ({
+    page,
+    request,
+  }) => {
+    const file = path.join(scratch, `overwrite-reopen-${scoped}.md`);
+    fs.writeFileSync(file, "# Reopen\n\nOriginal body.\n");
+    const journalId = (await (await request.get(`${origin}/api/status`)).json())
+      .reviewEvents.journalId;
+    const first = {
+      storeId: "overwrite-store",
+      generation: 1,
+      reviewId: `overwrite-${scoped}-first`,
+      operationId: `overwrite-${scoped}-first-open`,
+    };
+    const second = {
+      ...first,
+      generation: 2,
+      reviewId: `overwrite-${scoped}-second`,
+      operationId: `overwrite-${scoped}-second-open`,
+    };
+    const url = `${origin}/?${new URLSearchParams({ path: file, editor: "code" })}`;
+    await observeOpeningStream(page);
+    if (scoped) {
+      const registered = await request.post(`${origin}/api/open-request`, {
+        data: {
+          path: file,
+          url,
+          journalId,
+          reviewContext: first,
+          loadRequestId: "overwrite-first",
+          notify: false,
+        },
+      });
+      expect(registered.status()).toBe(200);
+      await page.goto((await registered.json()).url);
+      await expect(page.getByTestId("review-handoff-button")).toBeEnabled();
+    } else await page.goto(url);
+    await watchConnection(page, true, "open-requests");
+    const editor = page
+      .getByTestId("markdown-code-editor")
+      .locator(".cm-content");
+    await editor.click();
+    await page.keyboard.press("ControlOrMeta+End");
+    await page.keyboard.type("\nPreserved local overwrite draft.\n");
+    const reopened = await request.post(`${origin}/api/open-request`, {
+      data: {
+        path: file,
+        url,
+        loadRequestId: `overwrite-second-${scoped}`,
+        ...(scoped ? { journalId, reviewContext: second } : {}),
+      },
+    });
+    expect(reopened.status()).toBe(200);
+    expect((await reopened.json()).delivered).toBe(true);
+    await expect(page.getByTestId("file-conflict-notice")).toContainText(
+      "Your local draft was preserved",
+    );
+    expect(fs.readFileSync(file, "utf8")).toBe("# Reopen\n\nOriginal body.\n");
+    await expect(editor).toContainText("Preserved local overwrite draft.");
+    await page.getByTestId("file-conflict-action-overwrite").click();
+    await expect
+      .poll(() => fs.readFileSync(file, "utf8"))
+      .toContain("Preserved local overwrite draft.");
+    await expect(page.getByTestId("file-conflict-notice")).toBeHidden();
+    await expect(page.getByTestId("document-save-status")).toHaveAttribute(
+      "aria-label",
+      "Saved",
+    );
+    if (scoped) {
+      const done = page.getByTestId("review-handoff-button");
+      await expect(done).toBeEnabled();
+      await done.click();
+      await expect(done).toHaveText("Saved");
+      const receipt = await request.post(`${origin}/api/review-events/watch`, {
+        data: {
+          journalId,
+          reviewId: second.reviewId,
+          afterSequence: 0,
+          fromNow: false,
+          timeoutSeconds: 0,
+        },
+      });
+      expect((await receipt.json()).events).toHaveLength(1);
+    }
+  });
+}
+
+test("an old completion response cannot mark a newer loaded round Saved", async ({
+  page,
+  request,
+}) => {
+  const file = path.join(scratch, "old-completion-response.md");
+  fs.writeFileSync(file, "# Completion response race\n");
+  const journalId = (await (await request.get(`${origin}/api/status`)).json())
+    .reviewEvents.journalId;
+  const first = {
+    storeId: "delayed-response-store",
+    generation: 1,
+    reviewId: "delayed-first",
+    operationId: "delayed-first-open",
+  };
+  const second = {
+    ...first,
+    generation: 2,
+    reviewId: "delayed-second",
+    operationId: "delayed-second-open",
+  };
+  const url = `${origin}/?${new URLSearchParams({ path: file, editor: "code" })}`;
+  await observeOpeningStream(page);
+  const opened = await request.post(`${origin}/api/open-request`, {
+    data: {
+      path: file,
+      url,
+      journalId,
+      reviewContext: first,
+      loadRequestId: "delayed-first-load",
+      notify: false,
+    },
+  });
+  expect(opened.status()).toBe(200);
+  await page.goto((await opened.json()).url);
+  await watchConnection(page, true, "open-requests");
+  const done = page.getByTestId("review-handoff-button");
+  await expect(done).toBeEnabled();
+  let release!: () => void;
+  let committed!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const saved = new Promise<void>((resolve) => {
+    committed = resolve;
+  });
+  let intercepted = 0;
+  await page.route(/\/api\/review-events(?:\?|$)/, async (route) => {
+    const response = await route.fetch();
+    if (intercepted++ === 0) {
+      expect(response.status()).toBe(201);
+      committed();
+      await gate;
+    }
+    await route.fulfill({ response });
+  });
+  try {
+    await done.click();
+    await saved;
+    const receipt = await request.post(`${origin}/api/review-events/watch`, {
+      data: {
+        journalId,
+        reviewId: first.reviewId,
+        afterSequence: 0,
+        fromNow: false,
+        timeoutSeconds: 0,
+      },
+    });
+    expect((await receipt.json()).events).toHaveLength(1);
+    const reopened = await request.post(`${origin}/api/open-request`, {
+      data: {
+        path: file,
+        url,
+        journalId,
+        reviewContext: second,
+        loadRequestId: "delayed-second-load",
+      },
+    });
+    expect(reopened.status()).toBe(200);
+    await expect
+      .poll(
+        async () =>
+          (
+            await (
+              await request.get(
+                `${origin}/api/open-request/load?id=delayed-second-load`,
+              )
+            ).json()
+          ).load.status,
+      )
+      .toBe("loaded");
+    await expect(done).toHaveText("Approve");
+    await expect(done).toBeEnabled();
+    const oldResponse = page.waitForResponse(
+      (response) =>
+        response.request().method() === "POST" &&
+        new URL(response.url()).pathname === "/api/review-events",
+    );
+    release();
+    await (await oldResponse).finished();
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+        ),
+    );
+    expect(intercepted).toBe(1);
+    await expect(done).toHaveText("Approve");
+    const pending = await request.post(`${origin}/api/review-events/watch`, {
+      data: {
+        journalId,
+        reviewId: second.reviewId,
+        afterSequence: 0,
+        fromNow: false,
+        timeoutSeconds: 0,
+      },
+    });
+    expect((await pending.json()).events).toHaveLength(0);
+    await done.click();
+    await expect(done).toHaveText("Saved");
+    const secondReceipt = await request.post(
+      `${origin}/api/review-events/watch`,
+      {
+        data: {
+          journalId,
+          reviewId: second.reviewId,
+          afterSequence: 0,
+          fromNow: false,
+          timeoutSeconds: 0,
+        },
+      },
+    );
+    expect((await secondReceipt.json()).events).toHaveLength(1);
+    expect(intercepted).toBe(2);
+  } finally {
+    release();
+  }
+});
